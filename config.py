@@ -2,20 +2,30 @@
 config.py
 ---------
 Centralised configuration for the RF Satellite Link simulation.
-All physical and simulation parameters live here so that every module
-imports from a single source of truth.
+Updated to match the MATLAB/Simulink RF Satellite Link example more closely.
+
+Key changes vs original Python:
+  - Default noise_temp_k changed from 290 K → 20 K  (matches MATLAB nominal)
+  - Added apply_hpa / symbol_rate_baud (physical units)
+  - Added DPD parameters (apply_dpd, dpd_lut_points)
+  - Added colored phase-noise parameters (phase_noise_dbc_hz, phase_noise_freq_offset_hz)
+  - Added dc_offset_mode ("absolute" | "relative") + absolute offset fields
+  - Added cfo_correction_mode ("blind" | "ideal" | "carrier_sync")
+  - carrier_sync loop-bandwidth parameter
+  - Separate I/Q amplitude-only / phase-only test fields kept as scenario overrides
 """
 
 from dataclasses import dataclass, field
 from typing import List, Optional
+import math
 
 
 # ---------------------------------------------------------------------------
 # Physical constants
 # ---------------------------------------------------------------------------
-C_LIGHT = 2.998e8        # Speed of light (m/s)
-K_BOLTZMANN = 1.3806e-23  # Boltzmann constant (J/K)
-EARTH_RADIUS_KM = 6371.0  # Earth mean radius (km)
+C_LIGHT     = 2.998e8        # Speed of light (m/s)
+K_BOLTZMANN = 1.3806e-23     # Boltzmann constant (J/K)
+EARTH_RADIUS_KM = 6371.0     # Earth mean radius (km)
 
 
 @dataclass
@@ -23,67 +33,110 @@ class Config:
     # ------------------------------------------------------------------
     # Modulation
     # ------------------------------------------------------------------
-    modulation_order: int = 16       # QAM order  (must be 4, 16, 64, …)
-    bits_per_symbol: int = 4          # log2(16)
+    modulation_order:  int   = 16       # QAM order  (must be 4, 16, 64, …)
+    bits_per_symbol:   int   = 4        # log2(16) – recomputed in update()
 
     # ------------------------------------------------------------------
     # Pulse shaping filter
     # ------------------------------------------------------------------
-    rolloff: float = 0.25             # Excess bandwidth factor
-    span: int = 10                    # Filter span in symbols
-    samples_per_symbol: int = 8       # Upsampling factor
+    rolloff:           float = 0.25     # Excess bandwidth factor β
+    span:              int   = 10       # Filter span in symbols
+    samples_per_symbol: int  = 8        # Upsampling factor
 
     # ------------------------------------------------------------------
     # Link budget
     # ------------------------------------------------------------------
-    carrier_freq_hz: float = 4.0e9    # Downlink carrier frequency (Hz)
-    sat_altitude_km: float = 35_600.0 # Geostationary orbit altitude (km)
-    tx_antenna_diameter_m: float = 0.4
-    rx_antenna_diameter_m: float = 0.4
-    antenna_efficiency: float = 0.55  # Typical aperture efficiency
+    carrier_freq_hz:          float = 4.0e9      # Downlink carrier (Hz)
+    sat_altitude_km:          float = 35_600.0   # GEO altitude (km)
+    tx_antenna_diameter_m:    float = 0.4
+    rx_antenna_diameter_m:    float = 0.4
+    antenna_efficiency:       float = 0.55       # Aperture efficiency
+
+    # Physical symbol rate (baud).  Set to a positive value to use physical
+    # units for Doppler Hz, noise BW, etc.  Set to 0 to keep normalised mode
+    # (symbol_rate = 1 sym/s, matching the original Python behaviour).
+    symbol_rate_baud: float = 0.0    # 0 → normalised (legacy mode)
 
     # ------------------------------------------------------------------
     # HPA (Saleh TWTA memoryless model)
     # ------------------------------------------------------------------
-    # Saleh AM/AM coefficients  a_a, b_a  →  G_AM(r) = a_a*r / (1 + b_a*r²)
     hpa_saleh_a_a: float = 2.1587
     hpa_saleh_b_a: float = 1.1517
-    # Saleh AM/PM coefficients  a_p, b_p  →  Φ(r) = a_p*r² / (1 + b_p*r²)  [rad]
     hpa_saleh_a_p: float = 4.0033
     hpa_saleh_b_p: float = 9.1040
-    # Input back-off from saturation (dB).  Large → linear region; small → compressed
-    hpa_input_backoff_db: float = 7.0  # default; overridden per scenario
+    hpa_input_backoff_db: float = 7.0
+    apply_hpa: bool = True    # False → bypass (ideal linear amplifier)
+
+    # ------------------------------------------------------------------
+    # DPD – Digital Pre-Distortion  (NEW – MATLAB has this subsystem)
+    # ------------------------------------------------------------------
+    apply_dpd: bool = False
+    dpd_lut_points: int = 1024   # Resolution of the inverse-Saleh LUT
 
     # ------------------------------------------------------------------
     # Doppler
     # ------------------------------------------------------------------
-    doppler_hz: float = 3.0           # Simulated Doppler offset (Hz)
+    doppler_hz: float = 3.0
     apply_doppler_correction: bool = True
+
+    # CFO correction mode:
+    #   "blind"            – 4th-power NDA batch estimator (original Python)
+    #   "ideal"            – known true CFO fed in directly
+    #   "carrier_sync"     – simplified 2nd-order PLL (closer to MATLAB
+    #                        comm.CarrierSynchronizer)
+    cfo_correction_mode: str = "blind"
+
+    # PLL parameters (used only when cfo_correction_mode == "carrier_sync")
+    carrier_sync_loop_bw: float = 0.01    # Normalised loop bandwidth  BL*Ts
+    carrier_sync_damping: float = 0.707   # Damping factor ζ (Butterworth)
 
     # ------------------------------------------------------------------
     # Receiver thermal noise
     # ------------------------------------------------------------------
-    noise_temp_k: float = 290.0       # System noise temperature (K)
-    lna_gain_db: float = 30.0         # Low-noise amplifier gain (dB)
+    # MATLAB default is 20 K; original Python used 290 K.
+    noise_temp_k: float = 20.0     # System noise temperature (K) – MATLAB default
+    lna_gain_db:  float = 30.0     # Low-noise amplifier gain (dB)
 
     # ------------------------------------------------------------------
-    # Phase noise
+    # Phase noise  (MATLAB uses colored / dBc-Hz model)
     # ------------------------------------------------------------------
     apply_phase_noise: bool = False
-    phase_noise_power_rad2: float = 1e-4  # Variance of additive phase noise
+
+    # NEW: colored phase-noise model (matches MATLAB Phase Noise block)
+    phase_noise_dbc_hz:         float = -85.0   # Level at offset (dBc/Hz)
+    phase_noise_freq_offset_hz: float = 100.0   # Offset frequency (Hz)
+
+    # LEGACY: white phase noise (kept for backward compatibility)
+    # Set phase_noise_use_white = True to use the original simple model.
+    phase_noise_use_white: bool = False
+    phase_noise_power_rad2: float = 1e-4   # White noise variance (rad²)
 
     # ------------------------------------------------------------------
     # I/Q imbalance
     # ------------------------------------------------------------------
-    apply_iq_imbalance: bool = False
-    iq_amplitude_imbalance_db: float = 1.0   # dB
-    iq_phase_imbalance_deg: float = 5.0      # degrees
-    apply_iq_correction: bool = True
+    apply_iq_imbalance:       bool  = False
+    iq_amplitude_imbalance_db: float = 3.0    # MATLAB: 3 dB amplitude imbalance
+    iq_phase_imbalance_deg:   float = 20.0   # MATLAB: 20° phase imbalance
+    apply_iq_correction:      bool  = True
 
     # ------------------------------------------------------------------
     # DC offset
     # ------------------------------------------------------------------
     apply_dc_offset: bool = False
+
+    # Mode: "absolute"  → values in the same units as the (normalised) signal
+    #        "relative" → values as fractions of signal RMS (original Python)
+    dc_offset_mode: str = "absolute"
+
+    # MATLAB-style absolute offsets (tiny values because signal power is
+    # on the order of the physical link budget).  With apply_path_loss and
+    # apply_lna_gain the signal amplitude is ~ sqrt(10^((Gt-FSPL+Gr+GLNA)/10))
+    # ≈ 3e-4 V (for the default config), so 1e-8 is ~0.003 % of that — matching
+    # the MATLAB example's 1e-8 / 5e-8 offsets.
+    dc_offset_i_abs: float = 1e-8   # Absolute I offset
+    dc_offset_q_abs: float = 5e-8   # Absolute Q offset
+
+    # Legacy relative offsets (used when dc_offset_mode == "relative")
     dc_offset_i: float = 0.02
     dc_offset_q: float = 0.015
     apply_dc_correction: bool = True
@@ -91,8 +144,8 @@ class Config:
     # ------------------------------------------------------------------
     # AGC
     # ------------------------------------------------------------------
-    apply_agc: bool = True
-    agc_target_power: float = 1.0
+    apply_agc:         bool  = True
+    agc_target_power:  float = 1.0
 
     # ------------------------------------------------------------------
     # Simulation size
@@ -102,28 +155,32 @@ class Config:
     # ------------------------------------------------------------------
     # Misc
     # ------------------------------------------------------------------
-    random_seed: int = 42
-    verbose: bool = True
+    random_seed: int  = 42
+    verbose:     bool = True
 
     # ------------------------------------------------------------------
-    # Derived (computed lazily – call .update() after changing params)
+    # Derived (recomputed by update())
     # ------------------------------------------------------------------
-    symbol_rate_baud: float = field(init=False)
-    sample_rate_hz: float = field(init=False)
-    wavelength_m: float = field(init=False)
+    symbol_rate_baud_eff: float = field(init=False)   # effective symbol rate
+    sample_rate_hz:       float = field(init=False)
+    wavelength_m:         float = field(init=False)
     free_space_path_loss_db: float = field(init=False)
-    tx_antenna_gain_dbi: float = field(init=False)
-    rx_antenna_gain_dbi: float = field(init=False)
+    tx_antenna_gain_dbi:  float = field(init=False)
+    rx_antenna_gain_dbi:  float = field(init=False)
 
     def __post_init__(self):
         self.update()
 
     def update(self):
         """Recompute derived quantities after any parameter change."""
-        import math
         self.bits_per_symbol = int(math.log2(self.modulation_order))
-        self.symbol_rate_baud = 1.0                      # normalised
-        self.sample_rate_hz = self.symbol_rate_baud * self.samples_per_symbol
+
+        # Symbol / sample rates
+        if self.symbol_rate_baud > 0:
+            self.symbol_rate_baud_eff = float(self.symbol_rate_baud)
+        else:
+            self.symbol_rate_baud_eff = 1.0   # normalised
+        self.sample_rate_hz = self.symbol_rate_baud_eff * self.samples_per_symbol
 
         self.wavelength_m = C_LIGHT / self.carrier_freq_hz
 
@@ -145,23 +202,29 @@ class Config:
 
     def summary(self) -> str:
         lines = [
-            "=" * 60,
+            "=" * 65,
             "RF Satellite Link – Configuration Summary",
-            "=" * 60,
-            f"  Modulation          : {self.modulation_order}-QAM",
-            f"  Carrier frequency   : {self.carrier_freq_hz/1e9:.2f} GHz",
-            f"  Satellite altitude  : {self.sat_altitude_km:.0f} km",
-            f"  Free-space path loss: {self.free_space_path_loss_db:.1f} dB",
-            f"  Tx antenna gain     : {self.tx_antenna_gain_dbi:.1f} dBi",
-            f"  Rx antenna gain     : {self.rx_antenna_gain_dbi:.1f} dBi",
-            f"  LNA gain            : {self.lna_gain_db:.1f} dB",
-            f"  Noise temperature   : {self.noise_temp_k:.0f} K",
-            f"  HPA input back-off  : {self.hpa_input_backoff_db:.1f} dB",
-            f"  Doppler offset      : {self.doppler_hz:.1f} Hz",
-            f"  Phase noise         : {self.apply_phase_noise}",
-            f"  I/Q imbalance       : {self.apply_iq_imbalance}",
-            f"  DC offset           : {self.apply_dc_offset}",
-            f"  Num symbols         : {self.num_symbols}",
-            "=" * 60,
+            "=" * 65,
+            f"  Modulation            : {self.modulation_order}-QAM",
+            f"  Carrier frequency     : {self.carrier_freq_hz/1e9:.2f} GHz",
+            f"  Satellite altitude    : {self.sat_altitude_km:.0f} km",
+            f"  Free-space path loss  : {self.free_space_path_loss_db:.1f} dB",
+            f"  Tx antenna gain       : {self.tx_antenna_gain_dbi:.1f} dBi",
+            f"  Rx antenna gain       : {self.rx_antenna_gain_dbi:.1f} dBi",
+            f"  LNA gain              : {self.lna_gain_db:.1f} dB",
+            f"  Noise temperature     : {self.noise_temp_k:.0f} K",
+            f"  HPA bypass            : {not self.apply_hpa}",
+            f"  HPA input back-off    : {self.hpa_input_backoff_db:.1f} dB",
+            f"  DPD enabled           : {self.apply_dpd}",
+            f"  Doppler offset        : {self.doppler_hz:.1f} Hz",
+            f"  CFO correction mode   : {self.cfo_correction_mode}",
+            f"  Phase noise           : {self.apply_phase_noise}",
+            f"  I/Q imbalance         : {self.apply_iq_imbalance}",
+            f"    Amplitude imbalance : {self.iq_amplitude_imbalance_db:.1f} dB",
+            f"    Phase imbalance     : {self.iq_phase_imbalance_deg:.1f} deg",
+            f"  DC offset             : {self.apply_dc_offset} (mode={self.dc_offset_mode})",
+            f"  Num symbols           : {self.num_symbols}",
+            f"  Symbol rate           : {'normalised' if self.symbol_rate_baud == 0 else f'{self.symbol_rate_baud_eff:.0f} Baud'}",
+            "=" * 65,
         ]
         return "\n".join(lines)

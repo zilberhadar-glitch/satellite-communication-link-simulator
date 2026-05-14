@@ -1,105 +1,235 @@
-# RF Satellite Link Simulation – Python
-### A faithful Python reproduction of the MATLAB RF Satellite Link example
+# RF Satellite Link Simulation – Python (MATLAB-Equivalent)
+### Faithful Python reproduction of the MATLAB/Simulink RF Satellite Link example
+**Reference:** https://www.mathworks.com/help/comm/ug/rf-satellite-link.html
+
+---
 
 ```
 satellite_link/
-├── config.py        Physical constants, all tunable parameters, link-budget
-├── modulation.py    Gray-coded 16-QAM mapper / hard-decision demapper
-├── filters.py       Square-root raised-cosine (SRRC) filter design & application
-├── impairments.py   All RF impairments: Saleh TWTA HPA, path loss, Doppler,
-│                    AWGN, phase noise, I/Q imbalance, DC offset, LNA gain
-├── transmitter.py   Full Tx chain: bits → symbols → SRRC → HPA
-├── channel.py       Downlink: path loss + Doppler + noise + optional impairments
-├── receiver.py      Full Rx chain: CFO correction → SRRC → DC/AGC/IQ → demod
-├── metrics.py       BER theory (16-QAM AWGN), EVM, PAPR, link budget
-├── plots.py         Constellation, spectrum, BER curve, HPA AM/AM plots
-├── main.py          Experiment runner – 13 scenarios + BER vs Eb/N0 sweep
-└── requirements.txt numpy, scipy, matplotlib
+├── config.py                      All parameters + link-budget (updated)
+├── modulation.py                  Gray-coded 16-QAM mapper / demapper
+├── filters.py                     SRRC filter design & application
+├── impairments.py                 HPA, DPD, path loss, Doppler, AWGN,
+│                                  colored phase noise, I/Q imbalance,
+│                                  absolute DC offset, LNA gain (updated)
+├── transmitter.py                 Tx chain: bits→symbols→SRRC→DPD→HPA (updated)
+├── channel.py                     Downlink: path loss→Doppler→noise→LNA→... (updated)
+├── receiver.py                    Rx chain: MF→CFO(PLL/blind/ideal)→IQ→demod (updated)
+├── metrics.py                     BER theory, EVM, PAPR, link budget
+├── plots.py                       Constellation, spectrum, BER, HPA AM/AM
+├── main.py                        18-scenario runner (updated)
+├── run_matlab_equivalence_tests.py MATLAB-equivalence test suite (new)
+└── requirements.txt               numpy, scipy, matplotlib
 ```
 
 ## Quick start
 ```bash
 pip install -r requirements.txt
-python main.py
-# Plots saved to output_figures/
+python main.py                           # 18 scenarios + plots
+python run_matlab_equivalence_tests.py  # full MATLAB-equivalence suite
 ```
 
-## Simulation chain
+PowerShell:
+```powershell
+python main.py
+python run_matlab_equivalence_tests.py
+```
+
+---
+
+## What changed vs the original Python
+
+### 1. Digital Pre-Distortion (DPD) — NEW
+**MATLAB equivalent:** DPD subsystem in the RF Satellite Link Simulink model.
+
+`impairments.saleh_dpd()` implements an analytic LUT-based inverse of the Saleh
+AM/AM and AM/PM functions.  It maps the desired output amplitude to the required
+pre-distorted input amplitude by inverting the AM/AM curve over its monotone
+region [0, r_sat], and subtracts the corresponding AM/PM phase shift.
+
+Enable with `cfg.apply_dpd = True`.  Must be combined with `cfg.apply_hpa = True`.
+
+Expected outcome: IBO = 7 dB + DPD gives BER close to the near-linear IBO = 30 dB case.
+
+---
+
+### 2. Block ordering: noise BEFORE LNA — FIXED
+**MATLAB block diagram order:**
+```
+Rx antenna → Thermal Noise → LNA → Phase Noise → I/Q → DC → Rx processing
+```
+Original Python applied LNA *before* noise.  `channel.py` now matches MATLAB.
+
+SNR note: because SNR = P_signal / P_noise and the LNA multiplies both by the same
+gain, the SNR value is physically identical to the original.  The block order matters
+for fidelity of the hardware model, not for the SNR number.
+
+---
+
+### 3. Default noise temperature: 290 K → 20 K — FIXED
+`config.py` default `noise_temp_k = 20.0 K` (MATLAB nominal).
+290 K and 500 K are still tested as explicit scenarios.
+
+---
+
+### 4. Colored phase noise — NEW
+**MATLAB equivalent:** `comm.PhaseNoise` / Phase Noise block.
+
+`impairments.add_colored_phase_noise()` shapes white noise with a 1/f² PSD:
+
+    S_phi(f) = L0 × (f0/f)²    [rad²/Hz]
+
+Specified as `phase_noise_dbc_hz` (dBc/Hz at `phase_noise_freq_offset_hz`).
+Default: −85 dBc/Hz at 100 Hz.
+
+White phase noise (`phase_noise_use_white = True`) is kept as a legacy option.
+
+**Remaining difference:** MATLAB's block accepts a full PSD table; this implementation
+uses a single-point 1/f² approximation.  For exact reproduction, a full table lookup
+filter would be required.
+
+---
+
+### 5. DC offset: absolute mode — FIXED
+`cfg.dc_offset_mode = "absolute"` uses MATLAB-compatible absolute offsets
+(`dc_offset_i_abs = 1e-8`, `dc_offset_q_abs = 5e-8`).
+`"relative"` mode (fraction of RMS) kept as legacy.
+
+---
+
+### 6. Separate I/Q amplitude-only / phase-only scenarios — ADDED
+New MATLAB-compatible values: 3 dB amplitude imbalance, 20° phase imbalance.
+Scenarios 13–16 in `main.py` test each in isolation, with and without correction.
+
+---
+
+### 7. Carrier synchroniser (PLL) — NEW
+`cfg.cfo_correction_mode = "carrier_sync"` activates a decision-directed
+2nd-order PLL in `receiver.py`:
+- Proportional-plus-integral (PI) loop filter
+- Loop bandwidth `carrier_sync_loop_bw` (default 0.01 normalised)
+- Damping factor `carrier_sync_damping` (default 0.707 = Butterworth)
+
+**Comparison of modes:**
+
+| Mode | Description | MATLAB equivalent |
+|------|-------------|-------------------|
+| `"ideal"` | True CFO applied directly | Ideal correction / test mode |
+| `"blind"` | 4th-power NDA batch FFT | Open-loop estimator |
+| `"carrier_sync"` | Symbol-by-symbol DD-PLL | `comm.CarrierSynchronizer` |
+
+**Remaining difference:** MATLAB's `comm.CarrierSynchronizer` uses a proprietary
+loop filter implementation; the Python PLL matches the standard 2nd-order
+Gardner/DD-PLL structure but may differ in transient behaviour.
+
+---
+
+### 8. HPA bypass — ADDED
+`cfg.apply_hpa = False` bypasses the Saleh TWTA entirely (ideal linear amplifier).
+MATLAB equivalent: disconnecting the HPA block in the Simulink model.
+
+---
+
+### 9. Physical symbol rate support — ADDED
+Set `cfg.symbol_rate_baud > 0` to use physical units.
+`sample_rate_hz = symbol_rate_baud × samples_per_symbol`.
+Default `symbol_rate_baud = 0` keeps normalised mode (1 sym/s, backward compatible).
+
+---
+
+## Simulation chain (updated)
 
 ```
 [Random bits]
-     │
-     ▼ bits_to_symbols()
-[16-QAM symbols]  ──────────────────────► constellation "Before HPA"
-     │
-     ▼ tx_filter()  [SRRC upsample × 8]
+     ↓ bits_to_symbols()
+[16-QAM symbols]  ──────────────► constellation "Before HPA"
+     ↓ tx_filter()  [SRRC ×8]
 [Oversampled waveform]
-     │
-     ▼ saleh_hpa()  [Saleh TWTA model]
-[After-HPA waveform]  ──────────────────► constellation "After HPA"
-     │
-     ▼ apply_path_loss()  [195.5 dB FSPL – 2×21.9 dBi antenna gain]
-[Attenuated signal]
-     │
-     ▼ apply_doppler()  [complex rotation]
-     ▼ apply_lna_gain()  [30 dB]
-     ▼ add_awgn_noise()  [k_B × T × B]
-     ▼ add_phase_noise()  [optional]
-     ▼ apply_iq_imbalance()  [optional]
-     ▼ add_dc_offset()  [optional, signal-relative]
-     │
-     ▼ _doppler_correction()  [4th-power NDA CFO estimator]
-     ▼ rx_filter()  [SRRC matched filter + downsample]
-     ▼ _dc_correction()  [subtract mean]
-     ▼ _agc()  [scale to unit power]
-     ▼ _iq_imbalance_correction()  [2nd-order statistics]
-     │
-     ▼ symbols_to_bits()  [nearest-neighbour decision]
-[Decoded bits]  ──────────────────────────► BER / SER
+     ↓ saleh_dpd()  [optional – LUT-based inverse Saleh]
+[Pre-distorted waveform]
+     ↓ saleh_hpa()  [Saleh TWTA]  OR  bypass
+[After-HPA waveform]  ──────────► constellation "After HPA"
+     ↓ apply_path_loss()
+     ↓ apply_doppler()
+     ↓ add_awgn_noise()           ← BEFORE LNA (MATLAB order)
+     ↓ apply_lna_gain()           ← AFTER noise (MATLAB order)
+     ↓ add_colored_phase_noise()  [optional – 1/f² model]
+     ↓ apply_iq_imbalance()       [optional – amp or phase or both]
+     ↓ add_dc_offset()            [optional – absolute or relative]
+     ↓ ─ Receiver ──────────────────────────────────────────────
+     ↓ SRRC matched filter + downsample
+     ↓ CFO correction:
+     │    "ideal"        → multiply by exp(-j2π·f_true·t)
+     │    "blind"        → 4th-power NDA FFT estimator
+     │    "carrier_sync" → decision-directed 2nd-order PLL  ← MATLAB-like
+     ↓ data-aided residual phase correction  (ideal/blind only)
+     ↓ DC correction  (subtract mean)
+     ↓ I/Q imbalance correction  (2nd-order statistics)
+     ↓ AGC
+     ↓ symbols_to_bits()  [nearest-neighbour]
+[Decoded bits] ──────────────────► BER / SER
 ```
 
-## Scenarios & expected results
+---
 
-| # | Scenario | BER |
-|---|----------|-----|
-| 1 | Clean (no noise, IBO=30 dB) | 0 |
-| 2 | T=290 K (SNR=52 dB) | 0 |
-| 3 | T=20 K  (SNR=64 dB) | 0 |
-| 4 | T=500 K (SNR=50 dB) | 0 |
-| 5 | Doppler 3 Hz, **no correction** | ~50% |
-| 6 | Doppler 3 Hz, **corrected** | 0 |
-| 7 | HPA IBO=30 dB (near-linear) | 0 |
-| 8 | HPA IBO=7 dB (moderate) | ~7% |
-| 9 | HPA IBO=1 dB (heavy clipping) | ~18% |
-|10 | I/Q imbalance 1 dB / 5°, no corr. | 0* |
-|11 | I/Q imbalance, corrected | 0 |
-|12 | Phase noise σ²=1e-3 rad² | 0 |
-|13 | DC offset 2% / 1.5%, corrected | 0 |
+## Scenarios & expected results (main.py)
 
-*I/Q imbalance at 52 dB SNR is below the distortion floor for 16-QAM.
+| # | Scenario | Expected BER |
+|---|----------|-------------|
+| 1 | Clean (bypass, no noise) | 0 |
+| 2 | T=20 K (MATLAB nominal) | 0 |
+| 3 | T=290 K | 0 |
+| 4 | T=500 K | 0 |
+| 5 | Doppler 3 Hz, no correction | ~50% |
+| 6 | Doppler 3 Hz, blind NDA | ~0 |
+| 7 | Doppler 3 Hz, carrier_sync PLL | ~0 |
+| 8 | HPA bypass | 0 |
+| 9 | HPA IBO=30 dB | 0 |
+| 10 | HPA IBO=7 dB | ~7% |
+| 11 | HPA IBO=7 dB + DPD | ≪7% |
+| 12 | HPA IBO=1 dB | ~18% |
+| 13 | I/Q amp-only 3 dB, no corr | low |
+| 14 | I/Q amp-only 3 dB, corrected | 0 |
+| 15 | I/Q phase-only 20°, no corr | low |
+| 16 | I/Q phase-only 20°, corrected | 0 |
+| 17 | Colored phase noise −85 dBc/Hz | 0 |
+| 18 | DC offset absolute, corrected | 0 |
 
-## Key design choices
+---
 
-### SRRC filter delay
-Two `np.convolve(..., mode='full')` calls (one Tx, one Rx) each prepend
-`span×sps` leading samples, so the correct downsampling offset is
-`2 × span × sps` (= 160 samples for the default config).
+## MATLAB-vs-Python comparison (after fixes)
 
-### Noise scaling
-Physical noise power `k_B × T × B` is computed in SI watts, and the
-simulation signal has been scaled by the physical link gains via
-`apply_path_loss` and `apply_lna_gain`.  Both quantities live in the
-same "simulation amplitude = physical voltage" domain, so their ratio
-gives the correct SNR without any additional normalisation factor.
+| Feature | MATLAB | Python (after fixes) | Fidelity |
+|---------|--------|----------------------|----------|
+| Default noise temp | 20 K | 20 K ✓ | Exact |
+| Noise / LNA order | Noise → LNA | Noise → LNA ✓ | Exact |
+| HPA model | Saleh TWTA | Saleh TWTA ✓ | Exact |
+| HPA bypass | Yes | Yes ✓ | Exact |
+| DPD | LUT-based inverse | LUT-based inverse ✓ | Close |
+| Phase noise | PSD table + filter | 1/f² single-point approx | Approximate |
+| Carrier sync | `comm.CarrierSynchronizer` (DD-PLL) | DD 2nd-order PLL ✓ | Close |
+| DC offset | Absolute (1e-8/5e-8) | Absolute ✓ | Exact |
+| I/Q imbalance | 3 dB / 20° separate | 3 dB / 20° separate ✓ | Exact |
+| Symbol rate | Physical (Baud) | Physical or normalised ✓ | Exact |
+| Modulation | 16-QAM Gray | 16-QAM Gray ✓ | Exact |
+| SRRC filter | Raised cosine pair | SRRC pair ✓ | Exact |
 
-### DC offset
-Applied as a **fraction of the signal RMS** so it is meaningful across
-the huge dynamic range of the link budget (signal power ≈ 10⁻¹⁵ W after
-the LNA).  Default values 0.02 (I) and 0.015 (Q) represent 2 % / 1.5 %
-of RMS amplitude.
+### Remaining differences (cannot be exactly reproduced without MATLAB internals)
+1. **Phase noise PSD shape** – MATLAB uses an interpolated table; Python uses 1/f².
+2. **PLL transient convergence** – `comm.CarrierSynchronizer` uses a proprietary
+   normalisation; the Python PLL may converge slower on short bursts.
+3. **Random number generator** – MATLAB uses its own RNG; sequences differ.
+4. **Block internal states** – Simulink blocks carry inter-frame state; Python
+   processes each burst independently.
 
-### Doppler CFO estimator
-The 4th-power NDA estimator raises the signal to the 4th power to remove
-the 16-QAM modulation (all 16-QAM symbols lie on a circle of radius |s|,
-so s⁴ collapses to a tone at 4×f_doppler).  The spectral peak frequency
-is then divided by 4 to recover the CFO estimate.
+---
+
+## Running the equivalence suite (PowerShell)
+
+```powershell
+cd path\to\satellite_link
+pip install -r requirements.txt
+python run_matlab_equivalence_tests.py
+# Results: matlab_equivalence_outputs\matlab_equivalence_results.csv
+#          matlab_equivalence_outputs\matlab_equivalence_log.txt
+```
