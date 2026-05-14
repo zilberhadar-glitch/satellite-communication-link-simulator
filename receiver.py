@@ -41,33 +41,85 @@ def _agc(symbols: np.ndarray, target_power: float = 1.0) -> np.ndarray:
     return symbols
 
 
-def _iq_imbalance_correction(symbols: np.ndarray) -> np.ndarray:
+def _iq_correction_exact(symbols: np.ndarray) -> np.ndarray:
     """
-    Blind I/Q imbalance compensation using the second-order statistics method.
+    Model-matched I/Q imbalance correction.
 
-    Given  y = I_rx + j Q_rx  with amplitude ε and phase Δφ imbalance:
-        E[y²]  ≠  0   (would be zero for balanced I/Q)
+    The impairment model in impairments.apply_iq_imbalance() is:
+        I_out = I_in
+        Q_out = (1 + eps) * Q_in  +  I_in * sin(dphi)
 
-    We estimate and remove the conjugate image component.
+    This is algebraically equivalent to:
+        y = A * x  +  B * conj(x)
+    with
+        A = (2 + eps + j*sin(dphi)) / 2
+        B = (  -eps + j*sin(dphi)) / 2
 
-    Reference: Valkama et al., "Advanced methods for I/Q imbalance compensation
-    in communication receivers", IEEE Trans. Signal Proc., 2001.
+    Parameter estimation via cross-moments
+    ----------------------------------------
+    Because I_out = I_in, the I rail is untouched. This gives:
+
+        E[Re(y) * Im(y)] = E[I_in * Q_out]
+                         = E[I * ((1+eps)*Q + I*sin)]
+                         = (1+eps)*E[I*Q]  +  sin*E[I^2]
+                         = 0  +  sin * 0.5        (balanced 16-QAM: E[I*Q]=0)
+        => sin(dphi) = 2 * E[Re(y) * Im(y)]
+
+        E[Im(y)^2] = E[((1+eps)*Q + I*sin)^2]
+                   = (1+eps)^2 * 0.5  +  sin^2 * 0.5
+        => eps = sqrt(2*E[Im(y)^2] - sin(dphi)^2) - 1
+
+    Correction (exact inverse)
+    --------------------------
+        x = (conj(A) * y  -  B * conj(y)) / (|A|^2 - |B|^2)
+
+    Important: this function must be called BEFORE AGC.
+    AGC rescales amplitude uniformly, which alters E[Im^2] and would
+    break the eps estimate. The sin estimate is AGC-invariant in theory
+    but the eps estimate is not, so always correct before AGC.
+
+    Detection guard
+    ---------------
+    If both |sin_est| < 0.005 and |eps_est| < 0.001 the signal
+    appears balanced; skip correction to avoid injecting finite-sample
+    noise into a clean signal.
     """
-    # Estimate second-order statistics
-    c1 = np.mean(np.abs(symbols) ** 2)          # E[|y|²]
-    c2 = np.mean(symbols ** 2)                   # E[y²]  (image component)
-
-    if abs(c2) < 1e-10:
-        return symbols   # no imbalance detected
-
-    # Compensation matrix (2×2 equaliser)
-    alpha = c2 / c1
-    denom = 1.0 - abs(alpha) ** 2
-    if denom < 1e-8:
+    # Normalise by average symbol power so estimates are scale-invariant.
+    # After the matched filter, symbols are at physical signal amplitude
+    # (~10^-7 after path loss), not normalised to 1. Without this division
+    # the cross-moments are on the order of 10^-15 and eps_est collapses to -1.
+    pwr = float(np.mean(np.abs(symbols) ** 2))
+    if pwr < 1e-30:
         return symbols
 
-    corrected = (symbols - alpha * np.conj(symbols)) / denom
-    return corrected
+    # Estimate sin(dphi) from the normalised I-Q cross-moment
+    sin_est = 2.0 * float(np.mean(symbols.real * symbols.imag)) / pwr
+
+    # Estimate eps from the normalised Q-rail power
+    eimq2_n = float(np.mean(symbols.imag ** 2)) / pwr
+    radicand = 2.0 * eimq2_n - sin_est ** 2
+    if radicand < 0.0:
+        return symbols      # numerical issue; leave symbols unchanged
+
+    eps_est = float(np.sqrt(radicand)) - 1.0
+
+    # Detection guard — skip when both parameters are below noise floor
+    if abs(sin_est) < 0.005 and abs(eps_est) < 0.001:
+        return symbols
+
+    # Reconstruct A and B from the estimated parameters
+    A = (2.0 + eps_est + 1j * sin_est) / 2.0
+    B = (      -eps_est + 1j * sin_est) / 2.0
+
+    denom = abs(A) ** 2 - abs(B) ** 2
+    if abs(denom) < 1e-10:
+        return symbols
+
+    return (np.conj(A) * symbols - B * np.conj(symbols)) / denom
+
+
+# Public alias — nothing outside this file needs to change.
+_iq_imbalance_correction = _iq_correction_exact
 
 
 def _doppler_correction(signal: np.ndarray,
@@ -163,16 +215,22 @@ def receive(rx_signal: np.ndarray,
         symbols = _dc_correction(symbols)
 
     # ------------------------------------------------------------------
-    # 4. AGC
-    # ------------------------------------------------------------------
-    if cfg.apply_agc:
-        symbols = _agc(symbols, target_power=cfg.agc_target_power)
-
-    # ------------------------------------------------------------------
-    # 5. I/Q imbalance compensation
+    # 4. I/Q imbalance compensation  (must run BEFORE AGC)
+    #
+    #    The moment-matched estimator uses the ratio of I and Q power,
+    #    which is preserved by the matched filter but would be altered
+    #    by AGC's uniform amplitude scaling.  Correcting here, before
+    #    AGC normalises the constellation, gives the estimator access to
+    #    the unscaled second-order statistics it needs.
     # ------------------------------------------------------------------
     if cfg.apply_iq_imbalance and cfg.apply_iq_correction:
         symbols = _iq_imbalance_correction(symbols)
+
+    # ------------------------------------------------------------------
+    # 5. AGC
+    # ------------------------------------------------------------------
+    if cfg.apply_agc:
+        symbols = _agc(symbols, target_power=cfg.agc_target_power)
 
     # ------------------------------------------------------------------
     # 6. Hard-decision 16-QAM demodulation → bits
