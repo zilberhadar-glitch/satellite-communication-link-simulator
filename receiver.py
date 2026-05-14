@@ -122,31 +122,168 @@ def _iq_correction_exact(symbols: np.ndarray) -> np.ndarray:
 _iq_imbalance_correction = _iq_correction_exact
 
 
+def iq_correct_ideal(symbols: np.ndarray,
+                     amp_db: float,
+                     phase_deg: float) -> np.ndarray:
+    """
+    Ideal I/Q imbalance correction using the exact known impairment parameters.
+
+    This bypasses estimation entirely and applies the mathematically exact
+    inverse of the impairment model in impairments.apply_iq_imbalance().
+
+    Use this as an upper bound / validation mode to confirm that the
+    correction formula is correct independent of estimator quality.
+
+    Parameters
+    ----------
+    symbols   : received symbols (after matched filter, before AGC)
+    amp_db    : the amplitude imbalance that was applied (dB) — must be known
+    phase_deg : the phase imbalance that was applied (degrees) — must be known
+
+    Returns
+    -------
+    Corrected symbols at the same scale as the input.
+    """
+    if amp_db == 0.0 and phase_deg == 0.0:
+        return symbols
+
+    eps  = 10.0 ** (amp_db / 20.0) - 1.0
+    dphi = np.deg2rad(phase_deg)
+
+    A = (2.0 + eps + 1j * np.sin(dphi)) / 2.0
+    B = (      -eps + 1j * np.sin(dphi)) / 2.0
+
+    denom = abs(A) ** 2 - abs(B) ** 2
+    if abs(denom) < 1e-10:
+        return symbols
+
+    return (np.conj(A) * symbols - B * np.conj(symbols)) / denom
+
+
+def _cfo_estimate_symbol_rate(symbols: np.ndarray,
+                               fs_sym: float = 1.0,
+                               skip: int = 0,
+                               zp_factor: int = 4) -> float:
+    """
+    Estimate the carrier frequency offset (CFO) from symbol-rate samples.
+
+    Uses the 4th-power non-data-aided (NDA) method on the downsampled
+    (1 sample/symbol) sequence, with zero-padding to achieve sub-bin
+    frequency resolution.
+
+    Why symbol-rate, not oversampled?
+    ----------------------------------
+    The previous implementation ran on the oversampled waveform before
+    matched filtering.  This has two problems:
+
+    1. The SRRC filter has a passband of ±0.5/sps of the oversampled rate,
+       so Doppler offsets larger than that shift the signal outside the filter
+       band.  On the oversampled FFT the 4th-power tone lands outside the
+       meaningful band.
+    2. The SRRC pulse shape spreads energy, so the oversampled 4th-power
+       spectrum has no clean narrow tone even for large Doppler.
+
+    At symbol rate the signal is a flat-spectrum QAM sequence and the
+    4th-power tone is a clean spike at 4·f_CFO within [−2, +2] Hz.
+
+    Why zero-padding?
+    -----------------
+    Without zero-padding the FFT bin spacing is fs_sym/N = 1/10000 = 0.1 mHz,
+    which is sufficient.  However, the raw FFT peak sits on the nearest bin,
+    causing a quantisation error of up to fs_sym/(2·N) per estimate.  Over
+    N symbols this residual error accumulates as a phase ramp of up to
+    π radians, causing a BER floor.  4× zero-padding reduces the grid
+    spacing by 4× and the residual phase drift by 4×, enough to eliminate
+    the BER floor for offsets up to ~5% of symbol rate.
+
+    Parameters
+    ----------
+    symbols   : complex 1-D array at 1 sample/symbol (after matched filter)
+    fs_sym    : symbol rate in the simulation's normalised units (default 1.0)
+    skip      : number of leading symbols to discard (filter settling transient)
+    zp_factor : zero-padding multiplier for finer frequency grid (default 4)
+
+    Returns
+    -------
+    estimated CFO in the same units as fs_sym
+    """
+    s = symbols[skip:]
+    s4 = s ** 4
+    nfft = len(s4) * zp_factor
+    spectrum = np.fft.fft(s4, n=nfft)
+    freqs = np.fft.fftfreq(nfft, d=1.0 / fs_sym)
+    peak_idx = np.argmax(np.abs(spectrum))
+    return float(freqs[peak_idx] / 4.0)
+
+
+def _phase_estimate_data_aided(symbols: np.ndarray,
+                                ref_symbols: np.ndarray,
+                                skip: int = 0,
+                                n_pilot: int = 200) -> float:
+    """
+    Estimate the residual constant phase offset using known reference symbols.
+
+    After CFO correction there remains a constant (or slowly varying) phase
+    offset phi_0 that depends on the signal's initial phase when it entered
+    the channel.  This function estimates phi_0 from a short block of known
+    symbols (pilots or known preamble data).
+
+    In simulation, the transmitted symbols are always available, so this
+    implements a 'data-aided' or 'pilot-aided' estimator.  In hardware this
+    would be done with a known preamble or with decision-directed tracking.
+
+    Parameters
+    ----------
+    symbols     : received symbols after CFO correction
+    ref_symbols : ideal transmitted symbols (used as the pilot reference)
+    skip        : leading symbols to skip (filter settling)
+    n_pilot     : number of symbols to use for the average
+
+    Returns
+    -------
+    estimated phase offset in radians
+    """
+    i0 = skip
+    i1 = min(i0 + n_pilot, len(symbols), len(ref_symbols))
+    if i1 <= i0:
+        return 0.0
+    return float(np.angle(np.mean(symbols[i0:i1] * np.conj(ref_symbols[i0:i1]))))
+
+
 def _doppler_correction(signal: np.ndarray,
                         sample_rate: float,
                         carrier_freq_hz: float,
-                        coarse_freq_est_hz: float = None) -> np.ndarray:
+                        coarse_freq_est_hz: float = None) -> tuple:
     """
-    Carrier-frequency-offset (CFO) correction.
+    Carrier-frequency-offset (CFO) correction on the OVERSAMPLED signal.
 
-    If coarse_freq_est_hz is not supplied, the offset is estimated from
-    the 4th-power non-data-aided (NDA) estimator, which removes the QAM
-    modulation for QPSK/QAM (raises to the 4th power to collapse the
-    constellation, then looks for the spectral peak).
+    This function handles the case where the true (or externally provided)
+    CFO is known.  When coarse_freq_est_hz is None, it returns the signal
+    unchanged and estimated_offset=0.0; the actual blind estimation is
+    deferred to after matched filtering (see receive() step 2b).
+
+    Parameters
+    ----------
+    signal              : oversampled complex signal from the channel
+    sample_rate         : oversampled sample rate (sps × symbol rate)
+    carrier_freq_hz     : RF carrier (unused here, kept for API compatibility)
+    coarse_freq_est_hz  : if given, apply this correction immediately
+                          (ideal mode — the true CFO is passed in)
+
+    Returns
+    -------
+    (corrected_signal, estimated_offset_hz)
     """
     if coarse_freq_est_hz is None:
-        # 4th-power CFO estimator
-        s4 = signal ** 4
-        spectrum = np.fft.fft(s4)
-        freqs = np.fft.fftfreq(len(s4), d=1.0 / sample_rate)
-        peak_idx = np.argmax(np.abs(spectrum))
-        estimated_offset_hz = freqs[peak_idx] / 4.0  # divide back by 4
-    else:
-        estimated_offset_hz = coarse_freq_est_hz
+        # Blind estimation is deferred to after matched filtering.
+        # Return the signal unmodified; receiver() will call
+        # _cfo_estimate_symbol_rate() on the downsampled symbols.
+        return signal.copy(), 0.0
 
+    # Ideal (or externally supplied) correction on the oversampled signal.
     t = np.arange(len(signal)) / sample_rate
-    corrected = signal * np.exp(-1j * 2 * np.pi * estimated_offset_hz * t)
-    return corrected, estimated_offset_hz
+    corrected = signal * np.exp(-1j * 2 * np.pi * coarse_freq_est_hz * t)
+    return corrected, float(coarse_freq_est_hz)
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +304,8 @@ class RxResult:
 def receive(rx_signal: np.ndarray,
             tx_bits: np.ndarray,
             cfg: Config,
-            override_doppler_hz: float = None) -> RxResult:
+            override_doppler_hz: float = None,
+            ref_symbols: np.ndarray = None) -> 'RxResult':
     """
     Run the full receiver chain.
 
@@ -176,37 +314,91 @@ def receive(rx_signal: np.ndarray,
     rx_signal          : complex oversampled signal from the channel
     tx_bits            : reference bit stream (for BER computation)
     cfg                : simulation Config
-    override_doppler_hz: if given, use this value for correction instead of
-                         the blind estimator (simulates perfect Doppler knowledge)
+    override_doppler_hz: if given, apply this as the known CFO on the
+                         oversampled signal before matched filtering
+                         (ideal mode — does NOT use the blind estimator)
+    ref_symbols        : ideal transmitted symbols used for data-aided
+                         phase correction after blind CFO estimation.
+                         If None the function derives them from tx_bits.
 
     Returns
     -------
     RxResult
     """
+    from modulation import bits_to_symbols as _b2s
     sig = rx_signal.copy()
 
     # ------------------------------------------------------------------
-    # 1. Doppler / CFO correction  (operate on oversampled signal)
+    # 1. Ideal CFO correction on oversampled signal (only when the true
+    #    Doppler is explicitly provided; this is the "ideal" test mode).
+    #    Blind estimation is deferred to step 2b, after matched filtering,
+    #    where the estimator has access to clean symbol-rate samples.
     # ------------------------------------------------------------------
-    estimated_doppler = 0.0
-    if cfg.apply_doppler_correction:
-        known_doppler = override_doppler_hz if override_doppler_hz is not None else None
-        sig, estimated_doppler = _doppler_correction(
+    ideal_cfo_applied = False
+    if cfg.apply_doppler_correction and override_doppler_hz is not None:
+        sig, _ = _doppler_correction(
             sig,
             sample_rate=cfg.sample_rate_hz,
             carrier_freq_hz=cfg.carrier_freq_hz,
-            coarse_freq_est_hz=known_doppler,
+            coarse_freq_est_hz=override_doppler_hz,
         )
+        ideal_cfo_applied = True
         if cfg.verbose:
-            print(f"  [Rx] CFO correction: estimated={estimated_doppler:.3f} Hz")
+            print(f"  [Rx] CFO correction (ideal): {override_doppler_hz:.6f} Hz")
 
     # ------------------------------------------------------------------
-    # 2. SRRC matched filter + downsample
+    # 2. SRRC matched filter + downsample to 1 sample/symbol
     # ------------------------------------------------------------------
     delay = filter_delay(cfg.span, cfg.samples_per_symbol)
-    symbols = rx_filter(sig, cfg.srrc_h if hasattr(cfg, 'srrc_h') else
-                        _get_srrc_h(cfg),
+    symbols = rx_filter(sig,
+                        cfg.srrc_h if hasattr(cfg, 'srrc_h') else _get_srrc_h(cfg),
                         cfg.samples_per_symbol, delay)
+
+    # ------------------------------------------------------------------
+    # 2b. Blind CFO estimation and correction on symbol-rate data.
+    #     This runs only when Doppler correction is requested but no true
+    #     value was supplied.  The estimator uses the 4th-power method
+    #     with zero-padding on the downsampled symbols, which gives
+    #     sub-bin frequency resolution and avoids the SRRC spectral
+    #     distortion that occurs on the oversampled waveform.
+    # ------------------------------------------------------------------
+    estimated_doppler = 0.0
+    if cfg.apply_doppler_correction and not ideal_cfo_applied:
+        n_settle = cfg.span   # discard filter settling transient
+        estimated_doppler = _cfo_estimate_symbol_rate(
+            symbols,
+            fs_sym=1.0,          # normalised symbol rate
+            skip=n_settle,
+            zp_factor=4,
+        )
+        t_sym = np.arange(len(symbols))
+        symbols = symbols * np.exp(-1j * 2 * np.pi * estimated_doppler * t_sym)
+        if cfg.verbose:
+            print(f"  [Rx] CFO correction (blind): estimated={estimated_doppler:.6f} Hz")
+
+    elif ideal_cfo_applied:
+        estimated_doppler = float(override_doppler_hz)
+
+    # ------------------------------------------------------------------
+    # 2c. Data-aided residual phase correction.
+    #     After CFO removal a constant phase offset phi_0 remains (it
+    #     depends on where in the symbol period the channel's Doppler ramp
+    #     started).  We estimate phi_0 from a short block of known symbols,
+    #     skipping the filter settling period.
+    #     This step runs whenever Doppler correction is active.
+    # ------------------------------------------------------------------
+    if cfg.apply_doppler_correction:
+        if ref_symbols is None:
+            ref_symbols = _b2s(tx_bits, cfg.modulation_order)
+        n_settle = cfg.span
+        phase_offset = _phase_estimate_data_aided(
+            symbols, ref_symbols,
+            skip=n_settle,
+            n_pilot=200,
+        )
+        symbols = symbols * np.exp(-1j * phase_offset)
+        if cfg.verbose:
+            print(f"  [Rx] Phase correction (data-aided): {np.degrees(phase_offset):.2f} deg")
 
     # ------------------------------------------------------------------
     # 3. DC offset correction
@@ -216,12 +408,6 @@ def receive(rx_signal: np.ndarray,
 
     # ------------------------------------------------------------------
     # 4. I/Q imbalance compensation  (must run BEFORE AGC)
-    #
-    #    The moment-matched estimator uses the ratio of I and Q power,
-    #    which is preserved by the matched filter but would be altered
-    #    by AGC's uniform amplitude scaling.  Correcting here, before
-    #    AGC normalises the constellation, gives the estimator access to
-    #    the unscaled second-order statistics it needs.
     # ------------------------------------------------------------------
     if cfg.apply_iq_imbalance and cfg.apply_iq_correction:
         symbols = _iq_imbalance_correction(symbols)
