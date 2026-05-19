@@ -104,10 +104,15 @@ class Config:
 
     # NEW: colored phase-noise model (matches MATLAB Phase Noise block)
     phase_noise_dbc_hz:         float = -85.0   # Level at offset (dBc/Hz)
-    phase_noise_freq_offset_hz: float = 100.0   # Offset frequency (Hz)
+    phase_noise_freq_offset_hz: float = 100.0   # Offset frequency (Hz, physical)
+
+    # Physical sample rate used for Wiener sigma_w computation in normalised mode.
+    # Set to the physical sample rate (Hz) matching freq_offset_hz units.
+    # MATLAB RF Satellite Link: ~1 Mbaud x 8 sps = 8 MHz.
+    # When symbol_rate_baud > 0, this is overridden by update().
+    phase_noise_physical_sample_rate_hz: float = 8_000_000.0
 
     # LEGACY: white phase noise (kept for backward compatibility)
-    # Set phase_noise_use_white = True to use the original simple model.
     phase_noise_use_white: bool = False
     phase_noise_power_rad2: float = 1e-4   # White noise variance (rad²)
 
@@ -178,6 +183,8 @@ class Config:
         # Symbol / sample rates
         if self.symbol_rate_baud > 0:
             self.symbol_rate_baud_eff = float(self.symbol_rate_baud)
+            # Physical sample rate overrides the default for phase noise scaling
+            self.phase_noise_physical_sample_rate_hz = self.symbol_rate_baud_eff * self.samples_per_symbol
         else:
             self.symbol_rate_baud_eff = 1.0   # normalised
         self.sample_rate_hz = self.symbol_rate_baud_eff * self.samples_per_symbol
