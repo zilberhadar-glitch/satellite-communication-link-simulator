@@ -57,6 +57,13 @@ class Config:
     # (symbol_rate = 1 sym/s, matching the original Python behaviour).
     symbol_rate_baud: float = 0.0    # 0 → normalised (legacy mode)
 
+    # MATLAB's Doppler value is specified in physical Hz.  In normalised
+    # mode we still need a physical reference symbol rate so that 3 Hz is
+    # treated as a small carrier offset, not as 3 cycles/symbol.
+    # This preserves the MATLAB experiment behaviour while keeping the
+    # rest of the link in normalised units.
+    doppler_reference_symbol_rate_baud: float = 1_000.0
+
     # ------------------------------------------------------------------
     # HPA (Saleh TWTA memoryless model)
     # ------------------------------------------------------------------
@@ -129,39 +136,29 @@ class Config:
     # ------------------------------------------------------------------
     apply_dc_offset: bool = False
 
-    # DC offset mode and values
-    # --------------------------
-    # MATLAB's comm.IQImbalance block specifies DC offsets in physical voltage units:
-    #   "In-phase DC (1e-8 V)"    — changes constellation but does NOT cause errors alone
-    #   "Quadrature DC (5e-8 V)"  — causes errors even without other impairments
-    #
-    # WHY raw absolute values (1e-8/5e-8) cannot be used in Python normalised mode
-    # ------------------------------------------------------------------------------
-    # At the DC injection point (before LNA, after path-loss + Rx antenna gain),
-    # the normalised signal RMS is ~7.6e-10 (IBO=30 dB default).
-    # The raw MATLAB values would be:  1e-8 / 7.6e-10 = 13× signal RMS
-    #                                   5e-8 / 7.6e-10 = 66× signal RMS
-    # These would completely dominate and destroy the signal, not match MATLAB behaviour.
-    #
-    # MATLAB-equivalent fractions (derived from stated qualitative behaviour)
-    # -----------------------------------------------------------------------
-    # Fractions of signal RMS at the DC injection point that reproduce MATLAB's
-    # described behaviour in the normalised Python domain:
-    #   dc_offset_i = 0.05  → 5%  of RMS:  BER=0,    EVM≈5%    ← "changes constellation"
-    #   dc_offset_q = 0.29  → 29% of RMS:  BER≈1.4%, EVM≈28%   ← "causes errors alone"
-    # The ~5.8× ratio between offsets matches MATLAB's 5× ratio (1e-8 vs 5e-8).
-    #
-    # Default mode is "relative" (fraction of signal RMS at injection point).
+    # Mode: "absolute"  → values in the same units as the (normalised) signal
+    #        "relative" → values as fractions of signal RMS (original Python)
     dc_offset_mode: str = "relative"
-    dc_offset_i: float = 0.05   # MATLAB "In-phase DC (1e-8 V)" normalised equivalent
-    dc_offset_q: float = 0.29   # MATLAB "Quadrature DC (5e-8 V)" normalised equivalent
-    apply_dc_correction: bool = True
 
-    # Raw absolute values — only meaningful in physical-units mode (symbol_rate_baud > 0)
-    # with a Tx power budget that gives signal_rms ≈ 5e-8 V at the injection point.
-    # Do NOT use these in normalised mode; results will be physically incorrect.
+    # DC offset values.
+    #
+    # MATLAB specifies physical volt offsets: I=1e-8, Q=5e-8.
+    # The main Python simulation uses normalised signal amplitudes, so the
+    # MATLAB volt values cannot be inserted directly.  For the MATLAB-equivalent
+    # normalised path we use fractions of signal RMS chosen to reproduce the
+    # documented MATLAB behaviour:
+    #   * I offset: shifts the constellation but does not create errors alone.
+    #   * Q offset: creates errors and a visible DC component.
+    # The raw absolute fields remain available only for a fully physical-power
+    # extension, and channel.py warns if absolute mode is used with normalised
+    # symbol rate.
     dc_offset_i_abs: float = 1e-8
     dc_offset_q_abs: float = 5e-8
+
+    # MATLAB-equivalent normalised DC offsets, as fractions of signal RMS.
+    dc_offset_i: float = 0.05   # approx. MATLAB I DC 1e-8 behaviour
+    dc_offset_q: float = 0.29   # approx. MATLAB Q DC 5e-8 behaviour
+    apply_dc_correction: bool = True
 
     # ------------------------------------------------------------------
     # AGC
@@ -185,6 +182,8 @@ class Config:
     # ------------------------------------------------------------------
     symbol_rate_baud_eff: float = field(init=False)   # effective symbol rate
     sample_rate_hz:       float = field(init=False)
+    doppler_symbol_rate_eff: float = field(init=False)
+    doppler_sample_rate_hz:  float = field(init=False)
     wavelength_m:         float = field(init=False)
     free_space_path_loss_db: float = field(init=False)
     tx_antenna_gain_dbi:  float = field(init=False)
@@ -205,6 +204,17 @@ class Config:
         else:
             self.symbol_rate_baud_eff = 1.0   # normalised
         self.sample_rate_hz = self.symbol_rate_baud_eff * self.samples_per_symbol
+
+        # Separate Doppler timebase.  If the entire simulation is physical,
+        # use the physical symbol rate.  If the main simulation is normalised,
+        # use the MATLAB-reference symbol rate only for phase/frequency offset
+        # conversion.  This fixes the MATLAB Doppler=3 Hz case without changing
+        # the normalised link-budget/noise scaling.
+        if self.symbol_rate_baud > 0:
+            self.doppler_symbol_rate_eff = self.symbol_rate_baud_eff
+        else:
+            self.doppler_symbol_rate_eff = float(self.doppler_reference_symbol_rate_baud)
+        self.doppler_sample_rate_hz = self.doppler_symbol_rate_eff * self.samples_per_symbol
 
         self.wavelength_m = C_LIGHT / self.carrier_freq_hz
 
@@ -241,6 +251,7 @@ class Config:
             f"  HPA input back-off    : {self.hpa_input_backoff_db:.1f} dB",
             f"  DPD enabled           : {self.apply_dpd}",
             f"  Doppler offset        : {self.doppler_hz:.1f} Hz",
+            f"  Doppler ref. sym rate : {self.doppler_symbol_rate_eff:.0f} Baud",
             f"  CFO correction mode   : {self.cfo_correction_mode}",
             f"  Phase noise           : {self.apply_phase_noise}",
             f"  I/Q imbalance         : {self.apply_iq_imbalance}",

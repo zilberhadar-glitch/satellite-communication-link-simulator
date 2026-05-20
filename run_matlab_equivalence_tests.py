@@ -34,8 +34,9 @@ Closest approximations (documented):
                       (equivalent for stationary channel).
     IQ compensator  — DD two-stage LMS vs comm.IQImbalanceCompensator.
     Carrier sync    — coarse 4th-power + DA phase + fine DD-PLL vs single
-                      comm.CarrierSynchronizer (needed because Python has no
-                      cross-frame PLL state).
+                      comm.CarrierSynchronizer.  In normalised mode, Doppler Hz
+                      is converted through Config.doppler_reference_symbol_rate_baud
+                      so the MATLAB 3 Hz scenario is physically meaningful.
     DPD             — analytic Saleh inverse LUT vs MATLAB's DPD subsystem.
 
 OUTPUT
@@ -204,18 +205,21 @@ for ibo, dpd, label in [
 # ── A12-A13. MATLAB Doppler scenarios ────────────────────────────────────
 # MATLAB parameter: Doppler = 0 Hz, 3 Hz
 # Note: 3 Hz in MATLAB is 3 Hz relative to its physical symbol rate.
-# In Python normalised mode, 3 Hz = 3× symbol rate (outside pull-in range).
-# The no-correction case is reproduced correctly (BER≈50% due to rotation).
-# The corrected case uses blind + DA correction.
+# In Python normalised mode, the Doppler timebase is mapped through
+# Config.doppler_reference_symbol_rate_baud so the MATLAB 3 Hz setting is
+# physically meaningful rather than 3 cycles/symbol.
+# The corrected case uses coarse 4th-power + DD PLL approximation.
 print("\nA12-A13. Doppler scenarios (MATLAB Doppler Error parameter)")
 print("  NOTE: 'Doppler correction' in MATLAB uses comm.CarrierSynchronizer.")
 print("  Python uses coarse-4th-power + DA-phase + fine DD-PLL (closest approximation).")
-print("  Doppler=3Hz (normalised) = 3× symbol rate; correction uses coarse pre-step.")
+print("  In normalised amplitude mode, Doppler=3Hz is interpreted relative to")
+print("  Config.doppler_reference_symbol_rate_baud so it remains a physical 3 Hz")
+print("  offset, not 3 cycles/symbol.")
 
 cfg_no = _base()
 cfg_no.apply_doppler_correction = False
 r = run_one(cfg_no, "A12-Doppler=3Hz NO correction", override_doppler_hz=3.0)
-print(f"     A12: BER={r.ber:.3e}  EVM={r.evm_pct:.1f}%  (expect BER≈50%, full rotation)")
+print(f"     A12: BER={r.ber:.3e}  EVM={r.evm_pct:.1f}%  (expect large BER / rotating constellation)")
 results_A.append(r)
 
 cfg_cs = _base()
@@ -224,7 +228,7 @@ cfg_cs.cfo_correction_mode = "carrier_sync"
 cfg_cs.carrier_sync_loop_bw = 0.01
 cfg_cs.carrier_sync_damping = 0.707
 r = run_one(cfg_cs, "A13-Doppler=3Hz carrier_sync (approx. MATLAB)", override_doppler_hz=3.0)
-print(f"     A13: BER={r.ber:.3e}  EVM={r.evm_pct:.1f}%  (MATLAB-closest correction)")
+print(f"     A13: BER={r.ber:.3e}  EVM={r.evm_pct:.1f}%  (MATLAB-closest correction; expect BER→0)")
 results_A.append(r)
 
 # ── A14-A16. MATLAB phase noise scenarios ────────────────────────────────
@@ -247,7 +251,7 @@ for dbc, label in [
     cfg.phase_noise_dbc_hz = dbc
     cfg.phase_noise_freq_offset_hz = 100.0
     cfg.phase_noise_physical_sample_rate_hz = 8_000_000.0
-    r = run_one(cfg, label)
+    r = run_one(cfg, label, override_noise_temp_k=0.0)
     print(f"     {label[-30:]}: BER={r.ber:.3e}  EVM={r.evm_pct:.1f}%")
     results_A.append(r)
 

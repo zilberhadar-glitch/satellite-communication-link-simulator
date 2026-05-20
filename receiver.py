@@ -371,7 +371,7 @@ def receive(rx_signal: np.ndarray,
     ideal_cfo_applied = False
     if mode == "ideal" and override_doppler_hz is not None:
         sig = _doppler_correction_oversampled(
-            sig, cfg.sample_rate_hz, override_doppler_hz)
+            sig, cfg.doppler_sample_rate_hz, override_doppler_hz)
         ideal_cfo_applied = True
         if cfg.verbose:
             print(f"  [Rx] CFO correction (ideal): {override_doppler_hz:.6f} Hz")

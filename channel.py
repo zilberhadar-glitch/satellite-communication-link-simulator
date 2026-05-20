@@ -102,7 +102,7 @@ def propagate(tx_signal: np.ndarray,
     # ------------------------------------------------------------------
     # 2. Doppler frequency offset
     # ------------------------------------------------------------------
-    sig = apply_doppler(sig, doppler_hz, cfg.sample_rate_hz)
+    sig = apply_doppler(sig, doppler_hz, cfg.doppler_sample_rate_hz)
 
     # ------------------------------------------------------------------
     # 3. Receiver thermal noise (AWGN)  — BEFORE Phase Noise and LNA
@@ -160,8 +160,8 @@ def propagate(tx_signal: np.ndarray,
             if cfg.symbol_rate_baud <= 0:
                 warnings.warn(
                     "dc_offset_mode='absolute' with normalised symbol rate: "
-                    "MATLAB values 1e-8/5e-8 are ~1300x the signal RMS and will "
-                    "destroy the signal.  Use dc_offset_mode='relative' instead.",
+                    "MATLAB raw volt values 1e-8/5e-8 are not scaled to the normalised signal and may "
+                    "produce non-equivalent results.  Use dc_offset_mode='relative' for MATLAB-equivalent normalised mode.",
                     stacklevel=2,
                 )
             sig = add_dc_offset(sig, cfg.dc_offset_i_abs, cfg.dc_offset_q_abs)

@@ -74,41 +74,47 @@ def run_simulation(cfg, rng, name, override_doppler_hz=None,
 
 
 def run_ebn0_sweep(cfg_base, ebn0_db_values, rng_seed=0):
+    """
+    Extra validation only: BER of ideal 16-QAM over AWGN.
+
+    Noise is added directly at symbol rate after matched filtering so the
+    injected Eb/N0 matches the standard theoretical 16-QAM BER expression.
+    This is not a MATLAB RF Satellite Link scenario; it validates the mapper,
+    demapper and BER calculation.
+    """
     from filters import srrc_coeffs, tx_filter, rx_filter, filter_delay
     from modulation import bits_to_symbols, symbols_to_bits, symbol_error_rate
+
     cfg = copy.deepcopy(cfg_base)
     cfg.verbose = False
-    cfg.apply_doppler_correction = False
-    cfg.apply_phase_noise = False
-    cfg.apply_iq_imbalance = False
-    cfg.apply_dc_offset = False
-    cfg.apply_agc = True
-    cfg.apply_hpa = False   # pure AWGN sweep
+    cfg.apply_hpa = False
     h = srrc_coeffs(cfg.rolloff, cfg.span, cfg.samples_per_symbol)
     delay = filter_delay(cfg.span, cfg.samples_per_symbol)
     ebn0_list, ber_list = [], []
+
     for ebn0_db in ebn0_db_values:
         rng = np.random.default_rng(rng_seed)
         bits = rng.integers(0, 2, size=cfg.num_symbols * cfg.bits_per_symbol)
         symbols = bits_to_symbols(bits, cfg.modulation_order)
-        from filters import tx_filter as _txf
-        tx_sig = _txf(symbols, h, cfg.samples_per_symbol)
+
+        # Pulse-shape and matched-filter to keep the same modulation chain.
+        tx_sig = tx_filter(symbols, h, cfg.samples_per_symbol)
         tx_sig /= np.sqrt(np.mean(np.abs(tx_sig) ** 2))
-        ebn0_lin = 10 ** (ebn0_db / 10.0)
-        esn0_lin = ebn0_lin * cfg.bits_per_symbol
-        sigma = np.sqrt(1.0 / (2.0 * esn0_lin / cfg.samples_per_symbol))
-        noise = sigma * (rng.standard_normal(len(tx_sig)) + 1j * rng.standard_normal(len(tx_sig)))
-        rx_sig = tx_sig + noise
-        rx_syms = rx_filter(rx_sig, h, cfg.samples_per_symbol, delay)
-        pwr = np.mean(np.abs(rx_syms) ** 2)
-        if pwr > 0:
-            rx_syms /= np.sqrt(pwr)
-        rx_bits = symbols_to_bits(rx_syms[:cfg.num_symbols], cfg.modulation_order)
+        rx_syms = rx_filter(tx_sig, h, cfg.samples_per_symbol, delay)
+        rx_syms /= np.sqrt(np.mean(np.abs(rx_syms) ** 2))
+
+        # At symbol rate with Es=1 and k=bits/symbol:
+        # complex noise variance = N0 = 1/(Eb/N0*k)
+        sigma = np.sqrt(1.0 / (10**(ebn0_db/10) * cfg.bits_per_symbol))
+        noise = sigma * (rng.standard_normal(len(rx_syms))
+                         + 1j * rng.standard_normal(len(rx_syms)))
+        rx_bits = symbols_to_bits((rx_syms + noise)[:cfg.num_symbols],
+                                  cfg.modulation_order)
         ber, _, _ = symbol_error_rate(bits, rx_bits, cfg.bits_per_symbol)
-        ebn0_list.append(ebn0_db); ber_list.append(ber)
+        ebn0_list.append(ebn0_db)
+        ber_list.append(ber)
         print(f"  Eb/N0={ebn0_db:>5.1f} dB  BER={ber:.3e}")
     return ebn0_list, ber_list
-
 
 # ===========================================================================
 # Main
@@ -285,26 +291,28 @@ def main():
     # In Python normalised mode we use the equivalent relative fractions to
     # faithfully reproduce MATLAB's DC/signal ratio.  DC is injected BEFORE
     # the LNA, matching the MATLAB Simulink block diagram order.
-    print("\n--- Scenarios 22-23: DC Offset (MATLAB-equivalent, BEFORE LNA) ---")
+    print("\n--- Scenarios 22-25: DC Offset (MATLAB-equivalent normalised mode) ---")
     dc_cases = [
-        (False, "22. DC I=1.22% Q=6.10% of sig, no corr"),
-        (True,  "23. DC I=1.22% Q=6.10% of sig, IIR blocker"),
+        (0.05, 0.0,  False, "22. DC I=5% (MATLAB 1e-8 equiv), no corr"),
+        (0.05, 0.0,  True,  "23. DC I=5% (MATLAB 1e-8 equiv), IIR blocker"),
+        (0.0,  0.29, False, "24. DC Q=29% (MATLAB 5e-8 equiv), no corr"),
+        (0.0,  0.29, True,  "25. DC Q=29% (MATLAB 5e-8 equiv), IIR blocker"),
     ]
-    print(f"\n  {'Scenario':<46} {'BER':>10} {'EVM(%)':>8}  Notes")
-    print("  " + "-" * 80)
-    for corr, label in dc_cases:
+    print(f"\n  {'Scenario':<64} {'BER':>10} {'EVM(%)':>8}  Notes")
+    print("  " + "-" * 94)
+    for dc_i, dc_q, corr, label in dc_cases:
         print(f"\n--- Scenario {label} ---")
         cfg = copy.deepcopy(base_cfg)
         cfg.apply_dc_offset = True
-        cfg.dc_offset_mode = "relative"   # fraction of signal RMS before LNA
-        cfg.dc_offset_i    = 0.0122       # 1.22% ≡ MATLAB 1e-8 V / 8.19e-7 V
-        cfg.dc_offset_q    = 0.0610       # 6.10% ≡ MATLAB 5e-8 V / 8.19e-7 V
+        cfg.dc_offset_mode = "relative"   # MATLAB-equivalent normalised path
+        cfg.dc_offset_i = dc_i
+        cfg.dc_offset_q = dc_q
         cfg.apply_dc_correction = corr
         rng = np.random.default_rng(cfg.random_seed)
         r, *_ = run_simulation(cfg, rng, label, override_noise_temp_k=20.0)
         scenarios.append(r)
-        note = "IIR DC blocker (dsp.DCBlocker equiv.)" if corr else "no correction"
-        print(f"  {label:<46} {r.ber:>10.3e} {r.evm_pct:>8.2f}  [{note}]")
+        note = "IIR DC blocker (dsp.DCBlocker approx.)" if corr else "no correction"
+        print(f"  {label:<64} {r.ber:>10.3e} {r.evm_pct:>8.2f}  [{note}]")
 
     # ==================================================================
     # Summary table
