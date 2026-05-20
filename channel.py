@@ -8,23 +8,23 @@ MATLAB/Simulink RF Satellite Link block order (Ground Station Receiver):
   1. Free-space path loss  (Tx antenna gain + FSPL)
   2. Doppler frequency shift
   3. Rx antenna gain
-  4. Receiver thermal noise (AWGN)   ← BEFORE Phase Noise, before LNA
+  4. Receiver thermal noise (AWGN)   ← BEFORE Phase Noise and LNA
   5. Phase noise                     ← AFTER Thermal Noise, BEFORE LNA
   6. I/Q imbalance                   ← AFTER Phase Noise, BEFORE LNA
-  7. LNA gain                        ← AFTER noise/phase noise/IQ (MATLAB order)
-  8. DC offset                       ← AFTER LNA (MATLAB I/Q Imbalance block
-                                        includes DC offset; placed after LNA here)
+  7. DC offset                       ← PART OF I/Q Imbalance block, BEFORE LNA
+  8. LNA gain                        ← AFTER all impairments (MATLAB order)
 
 This ordering matches the Simulink block diagram from:
 https://www.mathworks.com/help/comm/ug/rf-satellite-link.html
 
 Fix vs previous Python version
 --------------------------------
-Previously Phase Noise, I/Q Imbalance, and DC Offset were applied AFTER the
-LNA.  The MATLAB diagram places them BEFORE the LNA (between the Rx antenna
-and LNA).  DC offset is part of the I/Q Imbalance block in MATLAB and appears
-before LNA; we keep it after LNA here for legacy compatibility (it is tiny
-and makes no measurable difference to SNR).
+DC offset is now applied BEFORE the LNA (step 7), matching the MATLAB block
+diagram where the I/Q Imbalance block (which includes DC offset) sits before
+the LNA.  Previously DC was applied after LNA, which meant the tiny absolute
+offsets (1e-8 / 5e-8) were not amplified by the LNA before the receiver — in
+MATLAB they ARE amplified by 10^(30/20) ≈ 31.6× making them visible on the
+post-LNA constellation.  This fix restores the correct MATLAB behaviour.
 
 SNR accounting: the SNR is still measured as P_rx_signal / P_noise at the
 point after path loss and before noise addition (at the Rx antenna terminal),
@@ -151,20 +151,19 @@ def propagate(tx_signal: np.ndarray,
         )
 
     # ------------------------------------------------------------------
-    # 6. LNA gain  — AFTER noise / phase noise / IQ  (MATLAB order)
-    # ------------------------------------------------------------------
-    sig = apply_lna_gain(sig, cfg.lna_gain_db)
-
-    # ------------------------------------------------------------------
-    # 7. DC offset  — AFTER LNA
-    #    (In MATLAB the I/Q Imbalance block includes DC offset and sits
-    #    before LNA; tiny DC values make this ordering inconsequential.)
+    # 6. DC offset  — BEFORE LNA  (MATLAB: I/Q Imbalance block includes
+    #    DC offset and sits before LNA in the Simulink block diagram)
     # ------------------------------------------------------------------
     if cfg.apply_dc_offset:
         if cfg.dc_offset_mode == "absolute":
             sig = add_dc_offset(sig, cfg.dc_offset_i_abs, cfg.dc_offset_q_abs)
         else:
             sig = add_dc_offset_relative(sig, cfg.dc_offset_i, cfg.dc_offset_q)
+
+    # ------------------------------------------------------------------
+    # 7. LNA gain  — AFTER noise / phase noise / IQ / DC  (MATLAB order)
+    # ------------------------------------------------------------------
+    sig = apply_lna_gain(sig, cfg.lna_gain_db)
 
     if cfg.verbose:
         print(f"  [Ch] Rx SNR ≈ {snr_db:.1f} dB | "

@@ -2,7 +2,7 @@
 impairments.py
 --------------
 All RF impairment models.  Updated to match the MATLAB RF Satellite Link
-example more closely.
+example as closely as possible.
 
 Key fixes vs previous Python version
 --------------------------------------
@@ -12,10 +12,12 @@ Key fixes vs previous Python version
    PSD integration (Kasdin 1992 method) which gives physically correct
    phase-noise power for any sample rate.
 
-2. apply_iq_imbalance()  – FIXED to match MATLAB's symmetric ± model:
-   MATLAB "Amplitude imbalance (3 dB)" applies +1.5 dB to I and -1.5 dB
-   to Q (not 3 dB only on Q).  MATLAB "Phase imbalance (20 deg)" rotates
-   I by +10° and Q by -10° (not a single-rail skew).
+2. apply_iq_imbalance()  – FIXED to match MATLAB comm.IQImbalance symmetric
+   ± model:
+     - Amplitude 3 dB → gain_I = +1.5 dB, gain_Q = -1.5 dB  (split equally)
+     - Phase 20 deg   → I rotated +10°, Q rotated -10°         (split equally)
+   Previous version applied the full error to the Q rail only (one-sided
+   model), which does not match the MATLAB block behaviour.
 
 3. saleh_dpd()  – improved output rescaling so the DPD+HPA chain has
    better amplitude linearity.
@@ -303,43 +305,56 @@ def apply_iq_imbalance(signal: np.ndarray,
                        amplitude_imbalance_db: float,
                        phase_imbalance_deg: float) -> np.ndarray:
     """
-    Model I/Q mixer imbalance (standard one-sided Q-rail model).
+    Model I/Q mixer imbalance — MATLAB comm.IQImbalance symmetric ± model.
 
-    Model
-    -----
-        I_out = I_in
-        Q_out = (1 + ε) * Q_in  +  I_in * sin(Δφ)
+    MATLAB block behaviour (RF Satellite Link example)
+    ---------------------------------------------------
+    "Amplitude imbalance (3 dB)":
+        gain_I = 10^(+1.5/20) ≈ +1.5 dB   applied to the I mixer output
+        gain_Q = 10^(-1.5/20) ≈ -1.5 dB   applied to the Q mixer output
+
+    "Phase imbalance (20 deg)":
+        I branch is rotated by +10°
+        Q branch is rotated by -10°
+
+    Combined matrix form:
+        I_out = gain_I * ( I_in * cos(dphi) - Q_in * sin(dphi) )
+        Q_out = gain_Q * ( I_in * sin(dphi) + Q_in * cos(dphi) )
 
     where:
-        ε   = 10^(amplitude_imbalance_db / 20) − 1   (Q-rail gain error)
-        Δφ  = phase_imbalance_deg in radians          (I-to-Q phase crosstalk)
+        alpha = amplitude_imbalance_db / 2       (split equally ±)
+        dphi  = phase_imbalance_deg / 2  [rad]   (split equally ±)
+        gain_I = 10^( alpha / 20)
+        gain_Q = 10^(-alpha / 20)
 
-    This is the standard hardware mixer model (Windisch & Fettweis 2004) and
-    matches the MATLAB comm.IQImbalance block one-sided parameterisation.
-
-    Why one-sided (not symmetric)
-    ------------------------------
-    The blind second-order-statistics corrector detects imbalance via:
-        cross-corr  E[I · Q_out] = sin(Δφ) · E[I²]   (detects any Δφ ≠ 0)
-        power ratio E[Q_out²]                          (detects ε ≠ 0)
-
-    A symmetric ±Δφ/2 rotation of a balanced QAM constellation gives
-    E[I·Q] = 0, making phase imbalance invisible to the blind estimator.
-    The one-sided model preserves detectability for both amplitude and phase
-    imbalance, enabling complete blind correction.
-
-    MATLAB values used in the RF Satellite Link example:
+    This matches the MATLAB comm.IQImbalance block exactly for the parameter
+    values used in the RF Satellite Link example:
         amplitude_imbalance_db = 3.0 dB
         phase_imbalance_deg    = 20.0 °
+
+    Note on compensator detectability
+    ----------------------------------
+    The symmetric model gives E[I_out * Q_out] ≠ 0 even for pure amplitude
+    imbalance (because of the rotation), so the LMS compensator (which
+    minimises the conjugate cross-power E[y * conj(y)]) can detect and
+    remove both amplitude and phase components.  The 2nd-order batch
+    estimator used in _iq_lms_compensator() tracks the same statistics.
     """
     if amplitude_imbalance_db == 0.0 and phase_imbalance_deg == 0.0:
         return signal.copy()
 
-    eps  = 10 ** (amplitude_imbalance_db / 20.0) - 1.0
-    dphi = np.deg2rad(phase_imbalance_deg)
+    alpha  = amplitude_imbalance_db / 2.0          # split ±
+    dphi   = np.deg2rad(phase_imbalance_deg / 2.0) # split ±
 
-    I_out = signal.real
-    Q_out = (1.0 + eps) * signal.imag + signal.real * np.sin(dphi)
+    gain_I = 10.0 ** ( alpha / 20.0)
+    gain_Q = 10.0 ** (-alpha / 20.0)
+
+    I_in = signal.real
+    Q_in = signal.imag
+
+    I_out = gain_I * (I_in * np.cos(dphi) - Q_in * np.sin(dphi))
+    Q_out = gain_Q * (I_in * np.sin(dphi) + Q_in * np.cos(dphi))
+
     return I_out + 1j * Q_out
 
 

@@ -210,13 +210,22 @@ def main():
         if ibo == 7 and not dpd:
             tx8, rx8 = tx_hpa, rx_hpa   # save for constellation
 
-    # ── 13–16. I/Q imbalance ─────────────────────────────────────────────
-    for amp, ph, corr, label in [
-        (3.0,  0.0,  False, "13. IQ amp-only no corr"),
-        (3.0,  0.0,  True,  "14. IQ amp-only corrected"),
-        (0.0,  20.0, False, "15. IQ phase-only no corr"),
-        (0.0,  20.0, True,  "16. IQ phase-only corrected"),
-    ]:
+    # ── 13–18. I/Q imbalance (MATLAB-equivalent symmetric ± model) ───────
+    # MATLAB options: Amplitude (3 dB), Phase (20°), combined, corrected/not.
+    # Python now uses the exact same symmetric ± model as comm.IQImbalance.
+    print("\n--- Scenarios 13-18: I/Q Imbalance (MATLAB symmetric ± model) ---")
+    iq_cases = [
+        # (amp_db, phase_deg, correction, label)
+        (3.0,  0.0,  False, "13. IQ amp-only 3dB no corr"),
+        (3.0,  0.0,  True,  "14. IQ amp-only 3dB corrected"),
+        (0.0,  20.0, False, "15. IQ phase-only 20deg no corr"),
+        (0.0,  20.0, True,  "16. IQ phase-only 20deg corrected"),
+        (3.0,  20.0, False, "17. IQ combined 3dB+20deg no corr"),
+        (3.0,  20.0, True,  "18. IQ combined 3dB+20deg corrected"),
+    ]
+    print(f"\n  {'Scenario':<38} {'BER':>10} {'EVM(%)':>8}  Notes")
+    print("  " + "-" * 65)
+    for amp, ph, corr, label in iq_cases:
         print(f"\n--- Scenario {label} ---")
         cfg = copy.deepcopy(base_cfg)
         cfg.apply_iq_imbalance = True
@@ -224,32 +233,78 @@ def main():
         cfg.iq_phase_imbalance_deg = ph
         cfg.apply_iq_correction = corr
         rng = np.random.default_rng(cfg.random_seed)
+        r, *_ = run_simulation(cfg, rng, label, override_noise_temp_k=0.0)
+        scenarios.append(r)
+        note = "LMS blind compensator" if corr else "no correction"
+        print(f"  {label:<38} {r.ber:>10.3e} {r.evm_pct:>8.1f}  [{note}]")
+
+    # ── 19–21. Phase noise — MATLAB levels: −100, −55, −48 dBc/Hz @ 100 Hz ──
+    # MATLAB RF Satellite Link parameter panel:
+    #   "Negligible (-100 dBc/Hz @ 100 Hz)"
+    #   "Low        (-55  dBc/Hz @ 100 Hz)"
+    #   "High       (-48  dBc/Hz @ 100 Hz)"
+    print("\n--- Scenarios 19-21: Phase Noise (MATLAB levels, Wiener 1/f² model) ---")
+    pn_cases = [
+        (-100.0, "19. Phase noise -100 dBc/Hz (negligible)"),
+        (-55.0,  "20. Phase noise  -55 dBc/Hz (low)"),
+        (-48.0,  "21. Phase noise  -48 dBc/Hz (high)"),
+    ]
+    print(f"\n  {'Scenario':<44} {'BER':>10} {'EVM(%)':>8} {'PN_rms(deg)':>12} {'PN_std(rad)':>12}")
+    print("  " + "-" * 90)
+    for pn_level, label in pn_cases:
+        print(f"\n--- Scenario {label} ---")
+        cfg = copy.deepcopy(base_cfg)
+        cfg.apply_phase_noise = True
+        cfg.phase_noise_dbc_hz = pn_level
+        cfg.phase_noise_freq_offset_hz = 100.0
+        cfg.phase_noise_physical_sample_rate_hz = 8_000_000.0  # 1 Mbaud × 8 sps
+        rng = np.random.default_rng(cfg.random_seed)
+
+        # Compute expected phase noise std for reporting
+        import math
+        L0 = 10.0 ** (pn_level / 10.0)
+        sigma_w2 = L0 * 8.0 * math.pi**2 * 100.0**2 / 8_000_000.0
+        sigma_w = math.sqrt(sigma_w2)
+        # RMS of a Wiener process of length N: sigma_w * sqrt(N/3)
+        N = base_cfg.num_symbols * base_cfg.samples_per_symbol
+        pn_rms_rad = sigma_w * math.sqrt(N / 3.0)
+        pn_rms_deg = math.degrees(pn_rms_rad)
+
+        r, *_ = run_simulation(cfg, rng, label, override_noise_temp_k=0.0)
+        scenarios.append(r)
+        print(f"  {label:<44} {r.ber:>10.3e} {r.evm_pct:>8.1f} "
+              f"{pn_rms_deg:>12.4f} {pn_rms_rad:>12.6f}")
+
+    # ── 22–23. DC offset (MATLAB-equivalent, BEFORE LNA, IIR corrected) ──
+    # MATLAB RF Satellite Link uses absolute DC values:
+    #   In-phase offset:   1e-8 V,  Quadrature offset: 5e-8 V
+    # These are physically meaningful only in physical-units mode.
+    # In physical mode, signal RMS ≈ 8.19e-7 V at the demodulator input,
+    # giving DC fractions of 1.22 % (I) and 6.10 % (Q) of signal amplitude.
+    #
+    # In Python normalised mode we use the equivalent relative fractions to
+    # faithfully reproduce MATLAB's DC/signal ratio.  DC is injected BEFORE
+    # the LNA, matching the MATLAB Simulink block diagram order.
+    print("\n--- Scenarios 22-23: DC Offset (MATLAB-equivalent, BEFORE LNA) ---")
+    dc_cases = [
+        (False, "22. DC I=1.22% Q=6.10% of sig, no corr"),
+        (True,  "23. DC I=1.22% Q=6.10% of sig, IIR blocker"),
+    ]
+    print(f"\n  {'Scenario':<46} {'BER':>10} {'EVM(%)':>8}  Notes")
+    print("  " + "-" * 80)
+    for corr, label in dc_cases:
+        print(f"\n--- Scenario {label} ---")
+        cfg = copy.deepcopy(base_cfg)
+        cfg.apply_dc_offset = True
+        cfg.dc_offset_mode = "relative"   # fraction of signal RMS before LNA
+        cfg.dc_offset_i    = 0.0122       # 1.22% ≡ MATLAB 1e-8 V / 8.19e-7 V
+        cfg.dc_offset_q    = 0.0610       # 6.10% ≡ MATLAB 5e-8 V / 8.19e-7 V
+        cfg.apply_dc_correction = corr
+        rng = np.random.default_rng(cfg.random_seed)
         r, *_ = run_simulation(cfg, rng, label, override_noise_temp_k=20.0)
         scenarios.append(r)
-
-    # ── 17. Phase noise (colored) ─────────────────────────────────────────
-    print("\n--- Scenario 17: Phase noise (colored, -85 dBc/Hz) ---")
-    cfg = copy.deepcopy(base_cfg)
-    cfg.apply_phase_noise = True
-    cfg.phase_noise_dbc_hz = -85.0
-    cfg.phase_noise_freq_offset_hz = 100.0
-    rng = np.random.default_rng(cfg.random_seed)
-    r, *_ = run_simulation(cfg, rng, "17. Phase noise colored -85dBc/Hz",
-                           override_noise_temp_k=20.0)
-    scenarios.append(r)
-
-    # ── 18. DC offset (absolute, corrected) ──────────────────────────────
-    print("\n--- Scenario 18: DC offset (absolute, corrected) ---")
-    cfg = copy.deepcopy(base_cfg)
-    cfg.apply_dc_offset = True
-    cfg.dc_offset_mode = "absolute"
-    cfg.dc_offset_i_abs = 1e-8
-    cfg.dc_offset_q_abs = 5e-8
-    cfg.apply_dc_correction = True
-    rng = np.random.default_rng(cfg.random_seed)
-    r, *_ = run_simulation(cfg, rng, "18. DC offset abs corrected",
-                           override_noise_temp_k=20.0)
-    scenarios.append(r)
+        note = "IIR DC blocker (dsp.DCBlocker equiv.)" if corr else "no correction"
+        print(f"  {label:<46} {r.ber:>10.3e} {r.evm_pct:>8.2f}  [{note}]")
 
     # ==================================================================
     # Summary table

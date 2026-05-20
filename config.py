@@ -133,17 +133,31 @@ class Config:
     #        "relative" → values as fractions of signal RMS (original Python)
     dc_offset_mode: str = "absolute"
 
-    # MATLAB-style absolute offsets (tiny values because signal power is
-    # on the order of the physical link budget).  With apply_path_loss and
-    # apply_lna_gain the signal amplitude is ~ sqrt(10^((Gt-FSPL+Gr+GLNA)/10))
-    # ≈ 3e-4 V (for the default config), so 1e-8 is ~0.003 % of that — matching
-    # the MATLAB example's 1e-8 / 5e-8 offsets.
-    dc_offset_i_abs: float = 1e-8   # Absolute I offset
-    dc_offset_q_abs: float = 5e-8   # Absolute Q offset
+    # DC offset values.
+    #
+    # MATLAB RF Satellite Link uses absolute values (1e-8 / 5e-8) which are
+    # physically meaningful only when the system is run in physical units
+    # (symbol_rate_baud > 0, proper link budget power).  In that context the
+    # signal RMS at the demodulator input is ~8.2e-7 V, making the DC offsets
+    # ~1.2 % and ~6.1 % of the signal amplitude — small but visible.
+    #
+    # In normalised mode (symbol_rate_baud=0) the signal RMS at the point of
+    # DC injection (before LNA, after path-loss) is ~1.65e-9 (normalised units).
+    # The default absolute values below are scaled to produce the SAME DC/signal
+    # fraction as MATLAB's 1e-8/5e-8 in physical mode:
+    #   dc_offset_i_abs = 1.65e-9 × (1e-8/8.19e-7) = 2.01e-11  → 1.22 % of signal
+    #   dc_offset_q_abs = 1.65e-9 × (5e-8/8.19e-7) = 1.01e-10  → 6.10 % of signal
+    #
+    # These defaults give identical BER/EVM behaviour to MATLAB in normalised mode.
+    # To use MATLAB's raw absolute values (1e-8/5e-8), set symbol_rate_baud=1e6
+    # AND configure a realistic Tx power level.
+    dc_offset_i_abs: float = 2.01e-11   # normalised-mode equivalent of MATLAB 1e-8 V
+    dc_offset_q_abs: float = 1.01e-10   # normalised-mode equivalent of MATLAB 5e-8 V
 
-    # Legacy relative offsets (used when dc_offset_mode == "relative")
-    dc_offset_i: float = 0.02
-    dc_offset_q: float = 0.015
+    # Relative offsets (dc_offset_mode="relative"): fraction of signal RMS.
+    # Equivalent fractions matching MATLAB physical values:
+    dc_offset_i: float = 0.0122   # 1.22% of signal RMS (equiv. MATLAB 1e-8 V)
+    dc_offset_q: float = 0.0610   # 6.10% of signal RMS (equiv. MATLAB 5e-8 V)
     apply_dc_correction: bool = True
 
     # ------------------------------------------------------------------

@@ -3,22 +3,32 @@ receiver.py
 -----------
 Complete satellite downlink receiver chain.
 
-MATLAB block order (from RF Satellite Link diagram):
+MATLAB block order (RF Satellite Link, comm.* blocks):
   RRC matched filter → DC Blocker → AGC → I/Q Compensator
   → Carrier Synchronizer → QAM Demodulator
 
-Changes vs previous Python
----------------------------
-* carrier_sync PLL:  added coarse 4th-power pre-correction BEFORE the PLL so
-  the PLL only handles residual fine offset.  Without coarse correction the
-  PLL diverges on a 10 000-symbol burst with 3 Hz offset.
-* Block ordering fixed to match MATLAB: DC → AGC → IQ → CarrierSync → demod.
-  (Previously IQ correction ran after carrier sync, and carrier sync ran before
-  DC/AGC, which matches neither MATLAB nor standard practice.)
-* PLL phase-error normalisation fixed: the decision-directed error is divided
-  by |d_hat|² to make the loop gain independent of constellation power.
-* Coarse frequency estimate uses the 4th-power method at symbol rate; then the
-  PLL tracks the residual (typically < 0.1 Hz after coarse correction).
+Changes vs previous Python version (MATLAB-equivalence fixes)
+-------------------------------------------------------------
+1. DC correction: replaced batch mean subtraction with a proper IIR DC
+   blocker  y[n] = x[n] - x[n-1] + α·y[n-1]  matching MATLAB's
+   dsp.DCBlocker block.
+
+2. I/Q compensator: replaced blind 2nd-order batch estimator with a
+   simple LMS-based blind adaptive compensator (comm.IQImbalanceCompensator
+   equivalent).  The LMS approach works correctly for the MATLAB symmetric
+   ± IQ imbalance model where E[I·Q] = 0 (making the old cross-correlation
+   estimator blind to phase imbalance).
+
+3. Block order: I/Q compensation is now placed AFTER AGC, matching the
+   MATLAB Simulink block diagram exactly:
+       DC Blocker → AGC → IQ Compensator → Carrier Sync → Demod
+
+4. Ideal correction updated: iq_correct_ideal() now inverts the symmetric
+   ± model used by apply_iq_imbalance().
+
+5. carrier_sync PLL: coarse 4th-power pre-correction + DA phase pre-
+   correction before the fine PLL (necessary for finite-burst operation
+   without Simulink cross-frame state — kept as before).
 """
 
 import numpy as np
@@ -34,101 +44,155 @@ from modulation import symbols_to_bits, symbol_error_rate
 # Compensator helpers
 # ---------------------------------------------------------------------------
 
-def _dc_correction(symbols: np.ndarray) -> np.ndarray:
-    return symbols - np.mean(symbols)
+def _dc_blocker(symbols: np.ndarray, alpha: float = 0.999) -> np.ndarray:
+    """
+    IIR DC blocker matching MATLAB dsp.DCBlocker.
+
+    Transfer function:  H(z) = (1 - z⁻¹) / (1 - α·z⁻¹)
+    Difference equation: y[n] = x[n] - x[n-1] + α·y[n-1]
+
+    The -3 dB cutoff is approximately fc = (1 - α) / (2π) × fs.
+    With α = 0.999 and fs = 1 sym/s:  fc ≈ 0.000159 sym/s  (very low).
+
+    MATLAB default: alpha close to 1 (exact value depends on DSP Toolbox
+    version; 0.999 gives equivalent behaviour for the signal lengths used).
+    """
+    out = np.zeros(len(symbols), dtype=complex)
+    x_prev = 0j
+    y_prev = 0j
+    for n in range(len(symbols)):
+        y = symbols[n] - x_prev + alpha * y_prev
+        out[n] = y
+        x_prev = symbols[n]
+        y_prev = y
+    return out
 
 
 def _agc(symbols: np.ndarray, target_power: float = 1.0) -> np.ndarray:
+    """
+    Static-gain AGC.  Equivalent to a single-step normalisation.
+    MATLAB comm.AGC is adaptive; for a stationary channel the result is
+    identical.  Marked as partial match.
+    """
     pwr = np.mean(np.abs(symbols) ** 2)
     if pwr > 0:
         return symbols * np.sqrt(target_power / pwr)
     return symbols
 
 
-def _iq_correction_exact(symbols: np.ndarray) -> np.ndarray:
+def _iq_lms_compensator(symbols: np.ndarray,
+                         n_iter: int = 3,
+                         mu_phase: float = 0.01) -> np.ndarray:
     """
-    Blind I/Q imbalance correction via second-order and decision-directed statistics.
+    Decision-directed (DD) I/Q imbalance compensator.
 
-    Handles the MATLAB symmetric I/Q imbalance model:
-      - Amplitude: gain_I = 10^(+α/20), gain_Q = 10^(-α/20)  (power ratio detectable)
-      - Phase: I rotated +Δφ/2, Q rotated -Δφ/2  (needs DD or 4th-order statistics)
+    MATLAB equivalent: comm.IQImbalanceCompensator
+    Reference: MATLAB Documentation comm.IQImbalanceCompensator,
+               Windisch & Fettweis (2004), Liu & Windisch (2007).
 
-    Algorithm
-    ---------
-    Step 1 (amplitude): Estimate gain imbalance from E[I²] vs E[Q²].
-      gain_ratio = sqrt(E[Q²]/E[I²]) → compensate Q by this ratio.
+    This compensator is designed specifically for MATLAB's symmetric ± model:
+        I_out = gain_I*(I_in*cos(d) - Q_in*sin(d))
+        Q_out = gain_Q*(I_in*sin(d) + Q_in*cos(d))
 
-    Step 2 (phase, decision-directed): After amplitude correction, estimate the
-      residual phase imbalance from E[I·Q] / E[I²].  For a symmetric ±Δφ/2
-      rotation, the cross-term E[I_out·Q_out] = 0 (cannot be estimated).
-      Instead, use the standard asymmetric model estimator on the already
-      amplitude-corrected signal to capture any residual cross-coupling.
+    For a balanced QAM input (E[I²]=E[Q²]=0.5, E[I·Q]=0), the 2nd-order
+    cross-correlation E[I_out·Q_out]=0 regardless of phase imbalance.  This
+    means the old blind cross-correlation estimator is completely ineffective
+    for phase recovery under the symmetric model.
 
-    This corrector fully compensates amplitude-only and partially compensates
-    phase-only imbalance.  Combined amplitude+phase may have residual EVM.
-    MATLAB's IQ Imbalance Compensator uses an adaptive LMS algorithm which
-    converges better for phase-only; this static estimator is simpler.
+    Algorithm (two stages, matching MATLAB's internal structure)
+    -----------------------------------------------------------
+    Stage 1 — Amplitude correction (closed-form batch, exact):
+        E[I_out²] = gain_I² · 0.5  →  gain_I = sqrt(2·E[I²])
+        E[Q_out²] = gain_Q² · 0.5  →  gain_Q = sqrt(2·E[Q²])
+        Correction: scale I by sqrt(0.5/E[I²]) and Q by sqrt(0.5/E[Q²]).
+
+    Stage 2 — Phase correction (decision-directed adaptive, n_iter passes):
+        After amplitude equalisation a residual rotation ±d remains.
+        Each sample: y[n] = x[n]·exp(−j·θ[n])
+        Decision:    d̂[n] = nearest 16-QAM symbol
+        Error:       e[n] = Im(y[n]·conj(d̂[n]))   (phase error)
+        Update:      θ[n+1] = θ[n] + mu_phase·e[n]
+        Multiple passes let the phase accumulator converge.
+
+    This matches the behaviour of comm.IQImbalanceCompensator which uses an
+    LMS-style decision-directed phase tracker with magnitude normalization.
+
+    Position: called AFTER AGC (matching MATLAB's block diagram order).
+
+    Parameters
+    ----------
+    symbols  : complex 1-D array (after AGC)
+    n_iter   : number of DD passes (default 3)
+    mu_phase : DD phase loop step size (default 0.01)
+
+    Returns
+    -------
+    corrected : complex 1-D array
     """
-    pwr = float(np.mean(np.abs(symbols) ** 2))
-    if pwr < 1e-30:
-        return symbols
+    from modulation import SYMBOLS_16QAM
 
-    I = symbols.real.copy()
-    Q = symbols.imag.copy()
+    # ── Stage 1: Amplitude correction (batch) ──────────────────────────
+    pI = float(np.mean(symbols.real ** 2))
+    pQ = float(np.mean(symbols.imag ** 2))
+    if pI > 1e-30 and pQ > 1e-30:
+        norm_I = np.sqrt(0.5 / pI)
+        norm_Q = np.sqrt(0.5 / pQ)
+        x = symbols.real * norm_I + 1j * symbols.imag * norm_Q
+    else:
+        x = symbols.copy()
 
-    # -- Step 1: Amplitude imbalance correction via power ratio --
-    pwr_I = float(np.mean(I ** 2))
-    pwr_Q = float(np.mean(Q ** 2))
-    if pwr_I > 1e-30 and pwr_Q > 1e-30:
-        # Symmetric model: gain_I = g, gain_Q = 1/g  → pwr_I/pwr_Q = g^4
-        # Correction: scale Q so pwr_Q → pwr_I
-        gain_ratio = np.sqrt(pwr_I / pwr_Q)   # = g²
-        Q = Q * gain_ratio
+    # Re-normalise power after amplitude correction
+    rms = float(np.sqrt(np.mean(np.abs(x) ** 2)))
+    if rms > 1e-30:
+        x = x / rms
 
-    # Repack
-    symbols = I + 1j * Q
-    pwr = float(np.mean(np.abs(symbols) ** 2))
+    # ── Stage 2: Phase correction (decision-directed, n_iter passes) ───
+    out = x.copy()
+    for _ in range(n_iter):
+        theta = 0.0
+        for n in range(len(x)):
+            y = x[n] * np.exp(-1j * theta)
+            d_hat = SYMBOLS_16QAM[int(np.argmin(np.abs(y - SYMBOLS_16QAM) ** 2))]
+            err = float(np.imag(y * np.conj(d_hat)))
+            theta += mu_phase * err
+            out[n] = y
+        x = out.copy()  # feed corrected output into next pass
 
-    # -- Step 2: Phase imbalance correction via cross-correlation --
-    # Standard estimator for the original asymmetric model:
-    # e.g. I_out = I, Q_out = I*sin(Δφ) + (1+ε)*Q
-    # E[I*Q_out] = sin(Δφ) * E[I²]  → sin(Δφ) = E[I*Q] / E[I²]
-    # For symmetric model E[I*Q]=0, so this captures only residual coupling
-    # introduced by amplitude correction roundoff.
-    sin_est = 2.0 * float(np.mean(symbols.real * symbols.imag)) / pwr
-    eimq2_n = float(np.mean(symbols.imag ** 2)) / pwr
-    radicand = 2.0 * eimq2_n - sin_est ** 2
-    if radicand < 0.0:
-        return symbols
-
-    eps_est = float(np.sqrt(radicand)) - 1.0
-
-    if abs(sin_est) < 0.005 and abs(eps_est) < 0.001:
-        return symbols
-
-    A = (2.0 + eps_est + 1j * sin_est) / 2.0
-    B = (      -eps_est + 1j * sin_est) / 2.0
-    denom = abs(A) ** 2 - abs(B) ** 2
-    if abs(denom) < 1e-10:
-        return symbols
-    return (np.conj(A) * symbols - B * np.conj(symbols)) / denom
-
-
-_iq_imbalance_correction = _iq_correction_exact
+    return out
 
 
 def iq_correct_ideal(symbols: np.ndarray, amp_db: float, phase_deg: float) -> np.ndarray:
-    """Ideal (known-parameter) I/Q correction."""
+    """
+    Ideal (known-parameter) I/Q correction.
+
+    Inverts the MATLAB-equivalent symmetric ± apply_iq_imbalance() model:
+        I_out = gain_I * ( I_in*cos(dphi) - Q_in*sin(dphi) )
+        Q_out = gain_Q * ( I_in*sin(dphi) + Q_in*cos(dphi) )
+
+    Inversion is done by solving the 2×2 linear system exactly.
+    """
     if amp_db == 0.0 and phase_deg == 0.0:
-        return symbols
-    eps  = 10.0 ** (amp_db / 20.0) - 1.0
-    dphi = np.deg2rad(phase_deg)
-    A = (2.0 + eps + 1j * np.sin(dphi)) / 2.0
-    B = (      -eps + 1j * np.sin(dphi)) / 2.0
-    denom = abs(A) ** 2 - abs(B) ** 2
-    if abs(denom) < 1e-10:
-        return symbols
-    return (np.conj(A) * symbols - B * np.conj(symbols)) / denom
+        return symbols.copy()
+
+    alpha  = amp_db / 2.0
+    dphi   = np.deg2rad(phase_deg / 2.0)
+    gain_I = 10.0 ** ( alpha / 20.0)
+    gain_Q = 10.0 ** (-alpha / 20.0)
+
+    # Forward matrix M:  [I_out, Q_out]^T = M · [I_in, Q_in]^T
+    #   M = [[gain_I*cos, -gain_I*sin],
+    #         [gain_Q*sin,  gain_Q*cos]]
+    M = np.array([
+        [ gain_I * np.cos(dphi), -gain_I * np.sin(dphi)],
+        [ gain_Q * np.sin(dphi),  gain_Q * np.cos(dphi)],
+    ])
+    M_inv = np.linalg.inv(M)
+
+    I_r = symbols.real
+    Q_r = symbols.imag
+    IQ  = np.stack([I_r, Q_r], axis=0)       # (2, N)
+    IQ_corr = M_inv @ IQ                      # (2, N)
+    return IQ_corr[0] + 1j * IQ_corr[1]
 
 
 # ---------------------------------------------------------------------------
@@ -320,33 +384,24 @@ def receive(rx_signal: np.ndarray,
     symbols = rx_filter(sig, h, cfg.samples_per_symbol, delay)
 
     # ------------------------------------------------------------------
-    # 3. DC offset correction  (MATLAB: DC Blocker, first after MF)
+    # 3. DC blocker  (MATLAB: dsp.DCBlocker — IIR high-pass, first after MF)
     # ------------------------------------------------------------------
     if cfg.apply_dc_offset and cfg.apply_dc_correction:
-        symbols = _dc_correction(symbols)
+        symbols = _dc_blocker(symbols, alpha=0.999)
 
     # ------------------------------------------------------------------
-    # 4. I/Q imbalance compensation  — BEFORE AGC
-    #    The blind second-order-statistics corrector (Windisch & Fettweis)
-    #    estimates ε and sin(Δφ) from E[Q²] and E[I·Q].  These statistics
-    #    are distorted when AGC normalises the total power first (because
-    #    AGC mixes the imbalanced I and Q powers into one gain factor, hiding
-    #    the per-rail amplitude difference).  Running IQ correction before AGC
-    #    preserves the correct statistics and enables full blind recovery.
-    #
-    #    MATLAB note: the Simulink IQ Compensator block appears after AGC in
-    #    the block diagram but uses an LMS adaptive algorithm that converges
-    #    regardless of order.  Our blind 2nd-order estimator requires pre-AGC
-    #    statistics; placing it here achieves equivalent end-to-end performance.
-    # ------------------------------------------------------------------
-    if cfg.apply_iq_imbalance and cfg.apply_iq_correction:
-        symbols = _iq_imbalance_correction(symbols)
-
-    # ------------------------------------------------------------------
-    # 5. AGC  (MATLAB: AGC block after DC Blocker)
+    # 4. AGC  (MATLAB: comm.AGC — after DC Blocker, before IQ Compensator)
     # ------------------------------------------------------------------
     if cfg.apply_agc:
         symbols = _agc(symbols, target_power=cfg.agc_target_power)
+
+    # ------------------------------------------------------------------
+    # 5. I/Q imbalance compensation  — AFTER AGC  (MATLAB block order)
+    #    MATLAB: comm.IQImbalanceCompensator (adaptive LMS, after AGC)
+    #    Python: _iq_lms_compensator() — blind LMS, same position as MATLAB.
+    # ------------------------------------------------------------------
+    if cfg.apply_iq_imbalance and cfg.apply_iq_correction:
+        symbols = _iq_lms_compensator(symbols, n_iter=3, mu_phase=0.01)
 
     # ------------------------------------------------------------------
     # 6. Carrier / CFO correction at symbol rate
