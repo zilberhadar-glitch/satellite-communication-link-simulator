@@ -156,8 +156,18 @@ def propagate(tx_signal: np.ndarray,
     # ------------------------------------------------------------------
     if cfg.apply_dc_offset:
         if cfg.dc_offset_mode == "absolute":
+            import warnings
+            if cfg.symbol_rate_baud <= 0:
+                warnings.warn(
+                    "dc_offset_mode='absolute' with normalised symbol rate: "
+                    "MATLAB values 1e-8/5e-8 are ~1300x the signal RMS and will "
+                    "destroy the signal.  Use dc_offset_mode='relative' instead.",
+                    stacklevel=2,
+                )
             sig = add_dc_offset(sig, cfg.dc_offset_i_abs, cfg.dc_offset_q_abs)
         else:
+            # "relative" — correct MATLAB-equivalent mode for normalised simulations.
+            # dc_offset_i and dc_offset_q are fractions of signal RMS at this point.
             sig = add_dc_offset_relative(sig, cfg.dc_offset_i, cfg.dc_offset_q)
 
     # ------------------------------------------------------------------

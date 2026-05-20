@@ -129,36 +129,39 @@ class Config:
     # ------------------------------------------------------------------
     apply_dc_offset: bool = False
 
-    # Mode: "absolute"  → values in the same units as the (normalised) signal
-    #        "relative" → values as fractions of signal RMS (original Python)
-    dc_offset_mode: str = "absolute"
-
-    # DC offset values.
+    # DC offset mode and values
+    # --------------------------
+    # MATLAB's comm.IQImbalance block specifies DC offsets in physical voltage units:
+    #   "In-phase DC (1e-8 V)"    — changes constellation but does NOT cause errors alone
+    #   "Quadrature DC (5e-8 V)"  — causes errors even without other impairments
     #
-    # MATLAB RF Satellite Link uses absolute values (1e-8 / 5e-8) which are
-    # physically meaningful only when the system is run in physical units
-    # (symbol_rate_baud > 0, proper link budget power).  In that context the
-    # signal RMS at the demodulator input is ~8.2e-7 V, making the DC offsets
-    # ~1.2 % and ~6.1 % of the signal amplitude — small but visible.
+    # WHY raw absolute values (1e-8/5e-8) cannot be used in Python normalised mode
+    # ------------------------------------------------------------------------------
+    # At the DC injection point (before LNA, after path-loss + Rx antenna gain),
+    # the normalised signal RMS is ~7.6e-10 (IBO=30 dB default).
+    # The raw MATLAB values would be:  1e-8 / 7.6e-10 = 13× signal RMS
+    #                                   5e-8 / 7.6e-10 = 66× signal RMS
+    # These would completely dominate and destroy the signal, not match MATLAB behaviour.
     #
-    # In normalised mode (symbol_rate_baud=0) the signal RMS at the point of
-    # DC injection (before LNA, after path-loss) is ~1.65e-9 (normalised units).
-    # The default absolute values below are scaled to produce the SAME DC/signal
-    # fraction as MATLAB's 1e-8/5e-8 in physical mode:
-    #   dc_offset_i_abs = 1.65e-9 × (1e-8/8.19e-7) = 2.01e-11  → 1.22 % of signal
-    #   dc_offset_q_abs = 1.65e-9 × (5e-8/8.19e-7) = 1.01e-10  → 6.10 % of signal
+    # MATLAB-equivalent fractions (derived from stated qualitative behaviour)
+    # -----------------------------------------------------------------------
+    # Fractions of signal RMS at the DC injection point that reproduce MATLAB's
+    # described behaviour in the normalised Python domain:
+    #   dc_offset_i = 0.05  → 5%  of RMS:  BER=0,    EVM≈5%    ← "changes constellation"
+    #   dc_offset_q = 0.29  → 29% of RMS:  BER≈1.4%, EVM≈28%   ← "causes errors alone"
+    # The ~5.8× ratio between offsets matches MATLAB's 5× ratio (1e-8 vs 5e-8).
     #
-    # These defaults give identical BER/EVM behaviour to MATLAB in normalised mode.
-    # To use MATLAB's raw absolute values (1e-8/5e-8), set symbol_rate_baud=1e6
-    # AND configure a realistic Tx power level.
-    dc_offset_i_abs: float = 2.01e-11   # normalised-mode equivalent of MATLAB 1e-8 V
-    dc_offset_q_abs: float = 1.01e-10   # normalised-mode equivalent of MATLAB 5e-8 V
-
-    # Relative offsets (dc_offset_mode="relative"): fraction of signal RMS.
-    # Equivalent fractions matching MATLAB physical values:
-    dc_offset_i: float = 0.0122   # 1.22% of signal RMS (equiv. MATLAB 1e-8 V)
-    dc_offset_q: float = 0.0610   # 6.10% of signal RMS (equiv. MATLAB 5e-8 V)
+    # Default mode is "relative" (fraction of signal RMS at injection point).
+    dc_offset_mode: str = "relative"
+    dc_offset_i: float = 0.05   # MATLAB "In-phase DC (1e-8 V)" normalised equivalent
+    dc_offset_q: float = 0.29   # MATLAB "Quadrature DC (5e-8 V)" normalised equivalent
     apply_dc_correction: bool = True
+
+    # Raw absolute values — only meaningful in physical-units mode (symbol_rate_baud > 0)
+    # with a Tx power budget that gives signal_rms ≈ 5e-8 V at the injection point.
+    # Do NOT use these in normalised mode; results will be physically incorrect.
+    dc_offset_i_abs: float = 1e-8
+    dc_offset_q_abs: float = 5e-8
 
     # ------------------------------------------------------------------
     # AGC
