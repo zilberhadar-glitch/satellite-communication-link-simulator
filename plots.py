@@ -172,6 +172,16 @@ def plot_spectra(tx_signal: np.ndarray,
     _apply_style()
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
     fig.suptitle(f"Power Spectral Density  {title_suffix}", fontsize=13, color="#e6edf3")
+    # Add a figure-level note explaining the absolute level difference
+    fig.text(
+        0.5, 0.01,
+        "Note: Tx and Rx PSDs are shown in absolute normalised power levels "
+        "(not peak-normalised). The ~130 dB level difference between panels "
+        "reflects free-space path loss minus LNA gain, not a filter or scaling error.",
+        ha="center", va="bottom", fontsize=7.5, color="#8b949e",
+        style="italic", wrap=True,
+    )
+    fig.subplots_adjust(bottom=0.18)   # make room for the note
 
     nperseg = min(1024, len(tx_signal) // 8)
 
@@ -292,13 +302,25 @@ def plot_srrc_response(h: np.ndarray, sps: int,
     H_mag_dB = 20 * np.log10(np.abs(np.fft.fftshift(H)) + 1e-30)
 
     ax.plot(freqs, H_mag_dB, color=ACCENT, lw=1.5)
-    ax.set_xlim(-sps / 2, sps / 2)
+    # Show ±1.5 symbol rates: wide enough to display full passband and
+    # first stopband lobe, narrow enough to avoid the confusing aliases
+    # that appear at ±(sps/2) = ±4 symbol rates in the oversampled grid.
+    ax.set_xlim(-1.5, 1.5)
     ax.set_ylim(-80, 5)
     ax.set_xlabel("Normalised Frequency (×symbol rate)")
     ax.set_ylabel("Magnitude (dB)")
     ax.axhline(-3, color="#8b949e", ls="--", lw=0.8, label="-3 dB")
     ax.legend(fontsize=8)
     ax.grid(True)
+    # Caption-style note: the filter is evaluated on the oversampled grid
+    # (sps=8), so the full Nyquist range is ±4 symbol rates; only ±1.5
+    # is shown here to focus on the passband and transition band.
+    ax.text(
+        0.99, 0.04,
+        f"Shown: ±1.5 sym rates.  Filter: rolloff=0.25, span=10, sps={sps}",
+        transform=ax.transAxes, ha="right", va="bottom",
+        fontsize=7.5, color="#8b949e", style="italic",
+    )
 
     plt.tight_layout()
     if save_path:

@@ -448,7 +448,11 @@ with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
                 "SNR_dB", "EVM_pct", "PAPR_dB", "Notes"])
     for r in all_results:
         section = r.notes.split("=")[1].split()[0] if "section=" in r.notes else "A"
-        w.writerow([section, r.name, f"{r.ber:.6e}", f"{r.ser:.6e}",
+        # Section B rows use shortcut paths that do not compute SER properly
+        # (the ScenarioResult default of 1.0 would be misleading).
+        # Emit "nan" for those rows so readers know SER was not measured.
+        ser_str = f"{r.ser:.6e}" if section == "A" else "nan"
+        w.writerow([section, r.name, f"{r.ber:.6e}", ser_str,
                     f"{r.ebn0_db:.2f}", f"{r.snr_db:.2f}",
                     f"{r.evm_pct:.2f}", f"{r.papr_db:.2f}", r.notes])
 
