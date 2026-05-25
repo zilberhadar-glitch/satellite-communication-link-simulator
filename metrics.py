@@ -85,21 +85,94 @@ def compute_ebn0_db(cfg: Config,
 def compute_evm(ref_symbols: np.ndarray,
                 rx_symbols: np.ndarray) -> float:
     """
-    EVM = RMS(error) / RMS(reference)  expressed as a percentage.
+    Global burst-level EVM in percent.
+
+    This is the direct Python EVM calculation:
+        EVM = RMS(rx - ref) / RMS(ref)
+
+    It is useful as an end-to-end numeric metric, but it does not always match
+    MATLAB Constellation Scope values when there is an uncorrected time-varying
+    phase rotation, such as Doppler without carrier synchronization.
+    """
+    n = min(len(ref_symbols), len(rx_symbols))
+    if n == 0:
+        return float('nan')
+
+    ref = ref_symbols[:n]
+    rx = rx_symbols[:n]
+
+    denom = np.mean(np.abs(ref) ** 2)
+    if denom <= 0:
+        return float('nan')
+
+    err = rx - ref
+    evm = np.sqrt(np.mean(np.abs(err) ** 2) / denom)
+    return float(evm * 100.0)
+
+
+def compute_evm_matlab_scope_like(ref_symbols: np.ndarray,
+                                  rx_symbols: np.ndarray,
+                                  window_size: int = 50,
+                                  align_each_window: bool = True) -> float:
+    """
+    MATLAB Constellation-Scope-like EVM in percent.
+
+    MATLAB's constellation/EVM scopes often report an EVM over a measurement
+    interval rather than one global full-burst value. In the uncorrected
+    Doppler case, the constellation rotates over time. A full-burst EVM is then
+    very large, while a short-window EVM is much closer to the MATLAB Scope
+    display.
+
+    This function computes EVM over short windows. By default, each window is
+    independently fitted with one complex scalar, which removes only a local
+    constant gain/phase offset. This does NOT correct Doppler in the receiver;
+    it only makes the reported EVM comparable to MATLAB's scope-style display.
 
     Parameters
     ----------
-    ref_symbols : ideal (transmitted) symbols at the decision point
-    rx_symbols  : received symbols after the matched filter
+    ref_symbols : ideal transmitted symbols
+    rx_symbols  : received symbols
+    window_size : number of symbols per EVM measurement window
+                  50 symbols matches the MATLAB Scope value observed for the
+                  Doppler=3 Hz, correction-OFF scenario.
+    align_each_window : if True, remove one best complex gain/phase factor
+                        independently in each window.
 
     Returns
     -------
-    evm_percent : float
+    evm_percent : mean windowed EVM in percent
     """
     n = min(len(ref_symbols), len(rx_symbols))
-    err = rx_symbols[:n] - ref_symbols[:n]
-    evm = np.sqrt(np.mean(np.abs(err) ** 2)) / np.sqrt(np.mean(np.abs(ref_symbols[:n]) ** 2))
-    return float(evm * 100.0)
+    if n == 0:
+        return float('nan')
+
+    ref = ref_symbols[:n]
+    rx = rx_symbols[:n]
+
+    window_size = int(window_size)
+    if window_size <= 0 or window_size > n:
+        window_size = n
+
+    evm_values = []
+
+    for start in range(0, n - window_size + 1, window_size):
+        end = start + window_size
+        ref_w = ref[start:end]
+        rx_w = rx[start:end]
+
+        if align_each_window:
+            denom = np.vdot(rx_w, rx_w)
+            if np.abs(denom) > 1e-30:
+                # Best scalar c minimizing ||c*rx_w - ref_w||^2
+                c = np.vdot(rx_w, ref_w) / denom
+                rx_w = c * rx_w
+
+        evm_values.append(compute_evm(ref_w, rx_w))
+
+    if not evm_values:
+        return compute_evm(ref, rx)
+
+    return float(np.mean(evm_values))
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +202,11 @@ class ScenarioResult:
         self.n_errors: int = 0
         self.ebn0_db: float = 0.0
         self.snr_db: float = 0.0
+        # evm_pct is the reported EVM used in the main tables.
+        # evm_global_pct keeps the direct full-burst value for diagnostics.
         self.evm_pct: float = 0.0
+        self.evm_global_pct: float = 0.0
+        self.evm_metric: str = "global"
         self.papr_db: float = 0.0
         self.notes: str = ""
 

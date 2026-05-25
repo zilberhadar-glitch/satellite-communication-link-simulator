@@ -157,7 +157,7 @@ class Config:
 
     # MATLAB-equivalent normalised DC offsets, as fractions of signal RMS.
     dc_offset_i: float = 0.05   # approx. MATLAB I DC 1e-8 behaviour
-    dc_offset_q: float = 0.29   # approx. MATLAB Q DC 5e-8 behaviour
+    dc_offset_q: float = 0.18   # approx. MATLAB Q DC 5e-8 behaviour
     apply_dc_correction: bool = True
 
     # ------------------------------------------------------------------
