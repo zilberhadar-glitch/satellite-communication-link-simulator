@@ -172,7 +172,6 @@ def run_simulation(cfg, rng, name, override_doppler_hz=None,
                 title_suffix=f"({name})",
                 save_path=fig_path(f"{safe_name}_spectrum.png"),
             )
-
             print("  [Plots] Saved:")
             print(f"    output_figures/{safe_name}_constellation.png")
             print(f"    output_figures/{safe_name}_spectrum.png")

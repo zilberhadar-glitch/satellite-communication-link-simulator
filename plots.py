@@ -87,6 +87,8 @@ def plot_constellations(symbols_before_hpa: np.ndarray,
 
         lim = max(np.percentile(np.abs(s.real), 99.5),
                   np.percentile(np.abs(s.imag), 99.5)) * 1.3
+        if not np.isfinite(lim) or lim <= 0:
+            lim = 1.5
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
         ax.axhline(0, color="#30363d", lw=0.8)
@@ -164,44 +166,94 @@ def plot_spectra(tx_signal: np.ndarray,
                  title_suffix: str = "",
                  save_path: Optional[str] = None):
     """
-    Two-panel PSD: transmitted (after HPA) and received (after channel).
-    Uses Welch's method.
+    MATLAB-Scope-like PSD overlay for Tx and Rx.
+
+    The simulator's channel signal can include very large physical link-budget
+    attenuation, while MATLAB's Spectrum Analyzer displays Tx/Rx traces on a
+    convenient visual scale.  Therefore this plot performs display-only peak
+    normalization: it aligns the *shape* of the Tx and Rx spectra on one axes,
+    without changing BER/EVM/MER/SNR or any saved numeric results.
+
+    The x-axis is kept in the simulator's native normalized-frequency units
+    (symbol-rate units).  Do not divide by 1e3 here unless sample_rate is a real
+    Hz sample rate; in this project it is usually an oversampling rate such as 8.
     """
     from scipy.signal import welch
 
     _apply_style()
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
-    fig.suptitle(f"Power Spectral Density  {title_suffix}", fontsize=13, color="#e6edf3")
-    # Add a figure-level note explaining the absolute level difference
+    fig, ax = plt.subplots(figsize=(13, 5))
+    fig.suptitle(f"Tx and Rx Spectrum  {title_suffix}", fontsize=13, color="#e6edf3")
+
+    tx_signal = np.asarray(tx_signal)
+    rx_signal = np.asarray(rx_signal)
+
+    min_len = min(len(tx_signal), len(rx_signal))
+    nperseg = min(2048, max(256, min_len // 8))
+    if nperseg > min_len:
+        nperseg = min_len
+
+    # Display offsets chosen to resemble MATLAB's overlaid spectrum view:
+    # Tx slightly above Rx, both visible on the same axes.
+    spectra = [
+        (tx_signal, "Transmitted", GOLD,   8.0),
+        (rx_signal, "Received",    ACCENT, -15.0),
+    ]
+
+    all_y = []
+    for sig, label, color, display_peak_db in spectra:
+        f, Pxx = welch(
+            sig,
+            fs=sample_rate,
+            nperseg=nperseg,
+            return_onesided=False,
+            scaling="density",
+        )
+
+        f = np.fft.fftshift(f)
+        Pxx = np.fft.fftshift(Pxx)
+        Pxx_dB = 10.0 * np.log10(Pxx + 1e-30)
+
+        # Display-only peak normalization.  This fixes the previous issue where
+        # path loss made Rx appear ~100 dB below Tx, and also avoids collapsing
+        # the frequency axis into a vertical line.
+        finite = np.isfinite(Pxx_dB)
+        if np.any(finite):
+            Pxx_dB = Pxx_dB - np.max(Pxx_dB[finite]) + display_peak_db
+
+        ax.plot(f, Pxx_dB, color=color, lw=1.2, label=label)
+        all_y.append(Pxx_dB)
+
+    ax.set_xlabel("Normalised Frequency (sym/s)")
+    ax.set_ylabel("Power (dB, display-normalized)")
+
+    # In this project sample_rate is usually samples/symbol, e.g. 8, so the
+    # Nyquist range is ±sample_rate/2 = ±4 sym/s.
+    f_lim = sample_rate / 2.0
+    if np.isfinite(f_lim) and f_lim > 0:
+        ax.set_xlim(-f_lim, f_lim)
+
+    if all_y:
+        y = np.concatenate([yy[np.isfinite(yy)] for yy in all_y if len(yy) > 0])
+        if len(y) > 0:
+            y_top = max(20.0, np.percentile(y, 99.5) + 5.0)
+            y_bottom = min(-90.0, np.percentile(y, 1.0) - 5.0)
+            ax.set_ylim(y_bottom, y_top)
+
+    ax.grid(True)
+    ax.legend(loc="upper left", fontsize=9)
+
     fig.text(
         0.5, 0.01,
-        "Note: Tx and Rx PSDs are shown in absolute normalised power levels "
-        "(not peak-normalised). The ~130 dB level difference between panels "
-        "reflects free-space path loss minus LNA gain, not a filter or scaling error.",
+        "Display note: Tx/Rx spectra are peak-normalized for MATLAB-Scope-like "
+        "visual comparison. This affects only this figure, not the simulation metrics.",
         ha="center", va="bottom", fontsize=7.5, color="#8b949e",
         style="italic", wrap=True,
     )
-    fig.subplots_adjust(bottom=0.18)   # make room for the note
 
-    nperseg = min(1024, len(tx_signal) // 8)
-
-    for ax, sig, label, color in [
-        (ax1, tx_signal, "Transmitted (after HPA)", ACCENT),
-        (ax2, rx_signal, "Received",                TEAL),
-    ]:
-        f, Pxx = welch(sig, fs=sample_rate, nperseg=nperseg, return_onesided=False)
-        f = np.fft.fftshift(f)
-        Pxx = np.fft.fftshift(Pxx)
-        Pxx_dB = 10 * np.log10(Pxx + 1e-30)
-        ax.plot(f, Pxx_dB, color=color, lw=1.2)
-        ax.set_title(label)
-        ax.set_xlabel("Normalised Frequency (sym/s)")
-        ax.set_ylabel("PSD (dB/Hz)")
-        ax.grid(True)
-
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     return fig
 
 
