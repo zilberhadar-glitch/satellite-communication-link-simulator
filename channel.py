@@ -107,11 +107,22 @@ def propagate(tx_signal: np.ndarray,
     # ------------------------------------------------------------------
     # 3. Receiver thermal noise (AWGN)  — BEFORE Phase Noise and LNA
     # ------------------------------------------------------------------
-    sig = add_awgn_noise(sig, noise_temp_k, cfg.sample_rate_hz, rng)
+    sig = add_awgn_noise(
+        sig,
+        noise_temp_k,
+        cfg.sample_rate_hz,
+        rng,
+        noise_power_scale=cfg.noise_power_scale,
+    )
 
     # Compute SNR at the Rx antenna (LNA gain cancels in the ratio)
     from config import K_BOLTZMANN
-    noise_power_theoretical = K_BOLTZMANN * noise_temp_k * (cfg.sample_rate_hz / 2.0)
+    noise_power_theoretical = (
+            K_BOLTZMANN
+            * noise_temp_k
+            * (cfg.sample_rate_hz / 2.0)
+            * cfg.noise_power_scale
+    )
     if noise_temp_k > 0 and rx_signal_power > 0:
         snr_db = 10.0 * np.log10(rx_signal_power / (noise_power_theoretical + 1e-300))
     else:

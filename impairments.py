@@ -177,7 +177,8 @@ def apply_doppler(signal: np.ndarray,
 def add_awgn_noise(signal: np.ndarray,
                    noise_temp_k: float,
                    sample_rate: float,
-                   rng: np.random.Generator) -> np.ndarray:
+                   rng: np.random.Generator,
+                   noise_power_scale: float = 1.0) -> np.ndarray:
     """
     Add complex AWGN whose power follows P_noise = k_B * T * B.
     Added BEFORE LNA (MATLAB block order).
@@ -186,6 +187,7 @@ def add_awgn_noise(signal: np.ndarray,
         return signal.copy()
 
     noise_power = K_BOLTZMANN * noise_temp_k * (sample_rate / 2.0)
+    noise_power *= noise_power_scale
     if np.mean(np.abs(signal) ** 2) <= 0:
         return signal.copy()
 

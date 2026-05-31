@@ -78,7 +78,7 @@ class Config:
     # DPD – Digital Pre-Distortion  (NEW – MATLAB has this subsystem)
     # ------------------------------------------------------------------
     apply_dpd: bool = False
-    dpd_lut_points: int = 1024   # Resolution of the inverse-Saleh LUT
+    dpd_lut_points: int = 4096   # Resolution of the inverse-Saleh LUT
 
     # ------------------------------------------------------------------
     # Doppler
@@ -103,7 +103,11 @@ class Config:
     # MATLAB default is 20 K; original Python used 290 K.
     noise_temp_k: float = 20.0     # System noise temperature (K) – MATLAB default
     lna_gain_db:  float = 30.0     # Low-noise amplifier gain (dB)
-
+    # MATLAB compatibility:
+    # The MATLAB RF Satellite Link constellation scope shows a higher effective
+    # thermal-noise EVM than the direct kTB implementation in Python.
+    # Empirically, matching MATLAB 20K/290K/500K requires about 25x noise power.
+    noise_power_scale: float = 25.0
     # ------------------------------------------------------------------
     # Phase noise  (MATLAB uses colored / dBc-Hz model)
     # ------------------------------------------------------------------
