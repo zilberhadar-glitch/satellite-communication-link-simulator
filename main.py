@@ -53,20 +53,46 @@ def fig_path(name):
     return os.path.join(OUT_DIR, name)
 
 
+def safe_filename(name):
+    name = str(name).strip().lower()
+    name = name.replace(" ", "_")
+    name = name.replace("/", "_")
+    name = name.replace("\\", "_")
+    name = name.replace(":", "_")
+    name = name.replace("+", "plus")
+    name = name.replace("=", "")
+    name = name.replace("(", "")
+    name = name.replace(")", "")
+    name = name.replace(",", "")
+    while "__" in name:
+        name = name.replace("__", "_")
+    return name.strip("_")
+
+
 # ===========================================================================
 # Core simulation helper
 # ===========================================================================
 
 def run_simulation(cfg, rng, name, override_doppler_hz=None,
-                   override_noise_temp_k=None, custom_backoff_db=None):
+                   override_noise_temp_k=None, custom_backoff_db=None,
+                   save_figures=True):
     attach_srrc_h(cfg)
     tx = transmit(cfg, rng, custom_backoff_db=custom_backoff_db)
     ch = propagate(tx.after_hpa, cfg, rng,
                    override_doppler_hz=override_doppler_hz,
                    override_noise_temp_k=override_noise_temp_k)
-    dop_rx = (override_doppler_hz
-              if (cfg.apply_doppler_correction and cfg.cfo_correction_mode == "ideal")
-              else None)
+    effective_doppler_hz = (
+        override_doppler_hz
+        if override_doppler_hz is not None
+        else cfg.doppler_hz
+    )
+
+    dop_rx = (
+        effective_doppler_hz
+        if (cfg.apply_doppler_correction and cfg.cfo_correction_mode == "ideal")
+        else None
+    )
+
     rx = receive(ch.signal, tx.bits, cfg, override_doppler_hz=dop_rx)
 
     r = ScenarioResult(name)
@@ -101,6 +127,59 @@ def run_simulation(cfg, rng, name, override_doppler_hz=None,
         r.evm_metric = "global full-burst EVM"
 
     r.papr_db = compute_papr_db(tx.after_hpa)
+
+    # ------------------------------------------------------------------
+    # Save scenario-specific figures to output_figures.
+    # This is useful when run_simulation() is called from
+    # run_single_matlab_like.py, because each single scenario then gets
+    # its own constellation and spectrum plots.
+    # ------------------------------------------------------------------
+    if save_figures:
+        try:
+            safe_name = safe_filename(name)
+
+            h = tx.srrc_h
+            delay = filter_delay(cfg.span, cfg.samples_per_symbol)
+
+            from filters import rx_filter
+
+            syms_before_hpa = rx_filter(
+                tx.filtered,
+                h,
+                cfg.samples_per_symbol,
+                delay
+            )[:cfg.num_symbols]
+
+            syms_after_hpa = rx_filter(
+                tx.after_hpa,
+                h,
+                cfg.samples_per_symbol,
+                delay
+            )[:cfg.num_symbols]
+
+            P.plot_constellations(
+                syms_before_hpa,
+                syms_after_hpa,
+                rx.symbols[:cfg.num_symbols],
+                title_suffix=f"({name})",
+                save_path=fig_path(f"{safe_name}_constellation.png"),
+            )
+
+            P.plot_spectra(
+                tx.after_hpa,
+                ch.signal,
+                sample_rate=cfg.sample_rate_hz,
+                title_suffix=f"({name})",
+                save_path=fig_path(f"{safe_name}_spectrum.png"),
+            )
+
+            print("  [Plots] Saved:")
+            print(f"    output_figures/{safe_name}_constellation.png")
+            print(f"    output_figures/{safe_name}_spectrum.png")
+
+        except Exception as e:
+            print(f"  [Plots] WARNING: Could not save scenario figures: {e}")
+
     return r, tx, ch, rx
 
 

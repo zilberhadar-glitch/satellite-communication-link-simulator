@@ -1,20 +1,28 @@
 import csv
 import re
+import os
 import numpy as np
 
 from config import Config
 from main import run_simulation
 from modulation import bits_to_symbols
 from metrics import compute_evm
+from filters import rx_filter, filter_delay
+import plots as P
+
+OUT_DIR = os.path.join(os.path.dirname(__file__), "output_figures")
+os.makedirs(OUT_DIR, exist_ok=True)
 
 
+def fig_path(name):
+    return os.path.join(OUT_DIR, name)
 # ============================================================
 # CHANGE ONLY THIS SECTION FOR EACH MATLAB SCENARIO
 # ============================================================
 
 SCENARIO = {
     # Scenario name
-    "name": "baseline_20K_after_noise_scale",
+    "name": "phase_noise_low_minus55",
 
     # MATLAB Model Parameters
     "sat_altitude_km": 35600.0,
@@ -26,11 +34,8 @@ SCENARIO = {
     "noise_temp_k": 20.0,
 
     # MATLAB mask: HPA backoff level
-    # This is almost linear.
     "apply_hpa": True,
     "hpa_input_backoff_db": 30.0,
-
-    # Keep MATLAB compatibility ON, but for 30 dB it should stay 30 dB.
     "use_matlab_hpa_compatibility": True,
 
     # MATLAB checkbox: Digital predistortion
@@ -43,9 +48,9 @@ SCENARIO = {
     "apply_doppler_correction": False,
     "cfo_correction_mode": "off",
 
-    # MATLAB mask: Phase noise = Negligible
+    # MATLAB mask: Phase noise = Low (-55 dBc/Hz @ 100 Hz)
     "apply_phase_noise": True,
-    "phase_noise_dbc_hz": -100.0,
+    "phase_noise_dbc_hz": -55.0,
     "phase_noise_freq_offset_hz": 100.0,
 
     # MATLAB mask: I/Q imbalance and DC offset = None
@@ -75,12 +80,11 @@ SCENARIO = {
     # Diagnostics
     "verbose": True,
 
-    # Fill these after MATLAB run
+    # Fill after MATLAB run
     "matlab_rms_evm_reference": None,
     "matlab_avg_mer_reference": None,
 
-    # For noise/baseline scenarios, this diagnostic calibration is allowed.
-    # It does not change the simulation, only prints a calibrated comparison metric.
+    # No external EVM calibration; noise is already calibrated in code.
     "use_0k_evm_calibration": False,
     "matlab_baseline_evm_0k": 2.72,
     "python_baseline_evm_0k": 0.80,
@@ -106,6 +110,59 @@ def mer_from_evm_percent(evm_percent):
     if evm_fraction <= 0:
         return float("inf")
     return -20.0 * np.log10(evm_fraction)
+
+
+def compute_matlab_like_evm_mer(ref_symbols, rx_symbols):
+    """
+    Compute EVM/MER metrics in the same display style as MATLAB's
+    Constellation Scope.
+
+    RMS EVM (%)   = RMS error magnitude normalized by RMS reference symbol.
+    Peak EVM (%)  = maximum error magnitude normalized by RMS reference symbol.
+    Avg EVM (dB)  = 20*log10(RMS EVM fraction).
+    Peak EVM (dB) = 20*log10(Peak EVM fraction).
+    Avg MER (dB)  = -Avg EVM (dB).
+    """
+    n = min(len(ref_symbols), len(rx_symbols))
+    if n == 0:
+        return {
+            "rms_evm_pct": float("nan"),
+            "peak_evm_pct": float("nan"),
+            "avg_evm_db": float("nan"),
+            "peak_evm_db": float("nan"),
+            "avg_mer_db": float("nan"),
+        }
+
+    ref = ref_symbols[:n]
+    rx = rx_symbols[:n]
+
+    ref_power = float(np.mean(np.abs(ref) ** 2))
+    if ref_power <= 0:
+        return {
+            "rms_evm_pct": float("nan"),
+            "peak_evm_pct": float("nan"),
+            "avg_evm_db": float("nan"),
+            "peak_evm_db": float("nan"),
+            "avg_mer_db": float("nan"),
+        }
+
+    ref_rms = np.sqrt(ref_power)
+    err_abs = np.abs(rx - ref)
+
+    rms_evm_frac = float(np.sqrt(np.mean(err_abs ** 2)) / ref_rms)
+    peak_evm_frac = float(np.max(err_abs) / ref_rms)
+
+    eps = 1e-12
+    avg_evm_db = 20.0 * np.log10(max(rms_evm_frac, eps))
+    peak_evm_db = 20.0 * np.log10(max(peak_evm_frac, eps))
+
+    return {
+        "rms_evm_pct": 100.0 * rms_evm_frac,
+        "peak_evm_pct": 100.0 * peak_evm_frac,
+        "avg_evm_db": float(avg_evm_db),
+        "peak_evm_db": float(peak_evm_db),
+        "avg_mer_db": float(-avg_evm_db),
+    }
 
 
 def safe_filename(name):
@@ -316,6 +373,7 @@ def main():
     ref_symbols = bits_to_symbols(tx.bits, cfg.modulation_order)
     direct_evm = compute_evm(ref_symbols, rx.symbols)
     mer_db = mer_from_evm_percent(direct_evm)
+    evm_mer = compute_matlab_like_evm_mer(ref_symbols, rx.symbols)
 
     evm_cal_factor, calibrated_evm, calibrated_mer = compute_calibrated_evm(
         direct_evm,
@@ -334,9 +392,13 @@ def main():
 
     print("\nEVM / MER")
     print("=" * 95)
-    print(f"Python EVM reported by main          = {result.evm_pct:.2f}%")
-    print(f"Python direct EVM recomputed         = {direct_evm:.2f}%")
-    print(f"Python estimated MER                 = {mer_db:.2f} dB")
+    print(f"{'RMS EVM (%)':40s} = {evm_mer['rms_evm_pct']:.2f}")
+    print(f"{'Peak EVM (%)':40s} = {evm_mer['peak_evm_pct']:.2f}")
+    print(f"{'Avg EVM (dB)':40s} = {evm_mer['avg_evm_db']:.2f}")
+    print(f"{'Peak EVM (dB)':40s} = {evm_mer['peak_evm_db']:.2f}")
+    print(f"{'Avg MER (dB)':40s} = {evm_mer['avg_mer_db']:.2f}")
+    print()
+    print(f"{'Python EVM reported by main':40s} = {result.evm_pct:.2f}%")
 
     if evm_cal_factor is not None:
         print()
@@ -430,6 +492,12 @@ def main():
         "python_evm_reported_by_main": result.evm_pct,
         "python_direct_evm": direct_evm,
         "python_mer_db": mer_db,
+
+        "rms_evm_percent": evm_mer["rms_evm_pct"],
+        "peak_evm_percent": evm_mer["peak_evm_pct"],
+        "avg_evm_db": evm_mer["avg_evm_db"],
+        "peak_evm_db": evm_mer["peak_evm_db"],
+        "avg_mer_db": evm_mer["avg_mer_db"],
 
         "use_0k_evm_calibration": scenario["use_0k_evm_calibration"],
         "evm_calibration_factor_0k": evm_cal_factor,
